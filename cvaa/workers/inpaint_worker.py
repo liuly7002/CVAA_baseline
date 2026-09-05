@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List
@@ -48,7 +49,26 @@ def _write_json(path: Path, value: Dict[str, Any]) -> None:
         )
 
 
+
+def _sum_performance(
+    results: List[Dict[str, Any]],
+    key: str,
+) -> float:
+    """汇总所有成功 actor 的 InpaintingEngine 性能字段。"""
+    total = 0.0
+    for result in results:
+        if result.get("status") != "ok":
+            continue
+        meta = result.get("meta") or {}
+        perf = meta.get("performance") or {}
+        total += float(perf.get(key, 0.0) or 0.0)
+    return float(total)
+
+
+
 def main() -> int:
+    worker_start = time.perf_counter()
+
     if len(sys.argv) != 3:
         print(
             "内部 worker 用法错误：inpaint_worker.py <request.json> <result.json>",
@@ -70,12 +90,17 @@ def main() -> int:
     results: List[Dict[str, Any]] = []
 
     try:
+        engine_init_start = time.perf_counter()
         engine = InpaintingEngine(
             cfg=cfg,
             lama_model_path=Path(
                 request["lama_model_path"]
             ),
             flux_model=str(request["flux_model"]),
+        )
+        engine_init_seconds = (
+            time.perf_counter()
+            - engine_init_start
         )
 
         total_items = len(items)
@@ -199,6 +224,101 @@ def main() -> int:
         import torch
         import diffusers
 
+        success_count = sum(
+            1
+            for result in results
+            if result.get("status") == "ok"
+        )
+        generation_total_seconds = (
+            _sum_performance(
+                results,
+                "total_seconds",
+            )
+        )
+
+        performance = {
+            "worker_wall_seconds": float(
+                time.perf_counter()
+                - worker_start
+            ),
+            "engine_init_seconds": float(
+                engine_init_seconds
+            ),
+            "engine_reported_load_seconds": float(
+                getattr(
+                    engine,
+                    "engine_load_seconds",
+                    0.0,
+                )
+            ),
+            "lama_model_load_seconds": float(
+                getattr(
+                    engine,
+                    "lama_load_seconds",
+                    0.0,
+                )
+            ),
+            "flux_model_load_seconds": float(
+                getattr(
+                    engine,
+                    "flux_load_seconds",
+                    0.0,
+                )
+            ),
+            "requested_interventions": int(
+                total_items
+            ),
+            "successful_interventions": int(
+                success_count
+            ),
+            "generation_total_seconds": float(
+                generation_total_seconds
+            ),
+            "generation_avg_seconds": (
+                float(
+                    generation_total_seconds
+                    / success_count
+                )
+                if success_count > 0
+                else 0.0
+            ),
+            "source_image_load_total_seconds":
+                _sum_performance(
+                    results,
+                    "source_image_load_seconds",
+                ),
+            "preprocess_total_seconds":
+                _sum_performance(
+                    results,
+                    "preprocess_seconds",
+                ),
+            "lama_total_seconds":
+                _sum_performance(
+                    results,
+                    "lama_seconds",
+                ),
+            "flux_total_seconds":
+                _sum_performance(
+                    results,
+                    "flux_seconds",
+                ),
+            "postprocess_total_seconds":
+                _sum_performance(
+                    results,
+                    "postprocess_seconds",
+                ),
+            "output_save_total_seconds":
+                _sum_performance(
+                    results,
+                    "output_save_seconds",
+                ),
+            "debug_save_total_seconds":
+                _sum_performance(
+                    results,
+                    "debug_save_seconds",
+                ),
+        }
+
         payload = {
             "status": "complete",
             "worker": "cvaa_fill",
@@ -209,8 +329,39 @@ def main() -> int:
             "diffusers_version": getattr(
                 diffusers, "__version__", None
             ),
+            "performance": performance,
             "results": results,
         }
+        print(
+            "[PERF][INPAINT] worker=%.3fs load=%.3fs "
+            "generation=%.3fs avg=%.3fs "
+            "LaMa=%.3fs FLUX=%.3fs PNG=%.3fs"
+            % (
+                performance[
+                    "worker_wall_seconds"
+                ],
+                performance[
+                    "engine_init_seconds"
+                ],
+                performance[
+                    "generation_total_seconds"
+                ],
+                performance[
+                    "generation_avg_seconds"
+                ],
+                performance[
+                    "lama_total_seconds"
+                ],
+                performance[
+                    "flux_total_seconds"
+                ],
+                performance[
+                    "output_save_total_seconds"
+                ],
+            ),
+            flush=True,
+        )
+
         _write_json(result_path, payload)
         return 0
 

@@ -9,6 +9,7 @@ import os
 import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1297,16 +1298,23 @@ class OfficialSimLingoRunner(object):
         checkpoint: Path,
         explicit_config: Optional[Path],
     ) -> None:
+        init_start = time.perf_counter()
+
         self.cfg_all = cfg
         self.sim_cfg = cfg["simlingo"]
         self.official_root = official_root.expanduser().resolve()
         self.checkpoint = checkpoint.expanduser().resolve()
 
+        source_guard_start = time.perf_counter()
         self.source_info = verify_official_tree(
             self.official_root,
             bool(self.sim_cfg.get("allow_nonofficial_tree", False)),
         )
         activate_official_source_tree(self.official_root)
+        self.source_guard_seconds = (
+            time.perf_counter()
+            - source_guard_start
+        )
 
         self.config_path = infer_config_path(
             self.checkpoint,
@@ -1320,6 +1328,7 @@ class OfficialSimLingoRunner(object):
 
         seed_everything(int(self.sim_cfg["seed"]))
 
+        model_load_start = time.perf_counter()
         (
             self.model_cfg,
             self.tokenizer,
@@ -1332,12 +1341,27 @@ class OfficialSimLingoRunner(object):
             config_path=self.config_path,
             device=self.device,
         )
+        self.model_load_seconds = (
+            time.perf_counter()
+            - model_load_start
+        )
+        self.init_total_seconds = (
+            time.perf_counter()
+            - init_start
+        )
+        self.last_timing: Dict[
+            str,
+            float,
+        ] = {}
 
     def infer(
         self,
         image_path: Path,
         measurement: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        total_start = time.perf_counter()
+
+        rgb_start = time.perf_counter()
         rgb = load_rgb_for_official_agent(
             image_path=image_path,
             emulate_online_jpeg_roundtrip=bool(
@@ -1345,7 +1369,12 @@ class OfficialSimLingoRunner(object):
             ),
             jpeg_quality=int(self.sim_cfg["jpeg_quality"]),
         )
+        rgb_load_seconds = (
+            time.perf_counter()
+            - rgb_start
+        )
 
+        input_start = time.perf_counter()
         driving_input, context = build_official_driving_input(
             rgb=rgb,
             measurement=measurement,
@@ -1355,13 +1384,44 @@ class OfficialSimLingoRunner(object):
             num_image_token=self.num_image_token,
             device=self.device,
         )
+        input_build_seconds = (
+            time.perf_counter()
+            - input_start
+        )
 
+        # 这里包含官方 SimLingo 的完整 forward：
+        # InternVL 视觉编码、语言 CoT greedy decoding、driving prediction。
+        model_start = time.perf_counter()
         seed_everything(int(self.sim_cfg["seed"]))
         prediction = infer_official_simlingo(
             model=self.model,
             driving_input=driving_input,
             save_language=bool(self.sim_cfg["save_language"]),
         )
+        model_forward_seconds = (
+            time.perf_counter()
+            - model_start
+        )
+
+        total_seconds = (
+            time.perf_counter()
+            - total_start
+        )
+        self.last_timing = {
+            "total_seconds": float(
+                total_seconds
+            ),
+            "rgb_load_seconds": float(
+                rgb_load_seconds
+            ),
+            "input_build_seconds": float(
+                input_build_seconds
+            ),
+            "model_forward_seconds": float(
+                model_forward_seconds
+            ),
+        }
+
         return prediction, context
 
     def close(self) -> None:

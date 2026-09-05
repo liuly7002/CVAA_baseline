@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -484,6 +485,7 @@ class LamaTorchscript(object):
         self.device = torch.device(
             str(device)
         )
+        lama_load_start = time.perf_counter()
         print(
             "[LaMa] loading %s on %s"
             % (
@@ -498,7 +500,14 @@ class LamaTorchscript(object):
         )
         self.model.eval()
         self.model.to(self.device)
-        print("[LaMa] ready")
+        self.load_seconds = (
+            time.perf_counter()
+            - lama_load_start
+        )
+        print(
+            "[LaMa] ready (load %.3fs)"
+            % self.load_seconds
+        )
 
     def __call__(
         self,
@@ -603,6 +612,8 @@ class InpaintingEngine(object):
         lama_model_path: Path,
         flux_model: str,
     ) -> None:
+        engine_load_start = time.perf_counter()
+
         self.cfg = cfg
         self.inpaint_cfg = cfg["inpainting"]
         self.mask_cfg = cfg["mask"]
@@ -616,6 +627,11 @@ class InpaintingEngine(object):
         self.pipe = None
         self.torch_module = torch
 
+        # 性能统计只记录 wall-clock，不改变任何模型行为。
+        self.lama_load_seconds = 0.0
+        self.flux_load_seconds = 0.0
+        self.engine_load_seconds = 0.0
+
         if self.backend in (
             "flux_fill",
             "lama_only",
@@ -627,6 +643,13 @@ class InpaintingEngine(object):
                         "lama_device"
                     ]
                 ),
+            )
+            self.lama_load_seconds = float(
+                getattr(
+                    self.lama,
+                    "load_seconds",
+                    0.0,
+                )
             )
 
         if (
@@ -640,10 +663,17 @@ class InpaintingEngine(object):
         ):
             self._load_flux(flux_model)
 
+        self.engine_load_seconds = (
+            time.perf_counter()
+            - engine_load_start
+        )
+
     def _load_flux(
         self,
         flux_model: str,
     ) -> None:
+        flux_load_start = time.perf_counter()
+
         try:
             from diffusers import (
                 FluxFillPipeline,
@@ -722,6 +752,15 @@ class InpaintingEngine(object):
 
         self.pipe.set_progress_bar_config(
             disable=False
+        )
+
+        self.flux_load_seconds = (
+            time.perf_counter()
+            - flux_load_start
+        )
+        print(
+            "[FLUX] ready (load %.3fs)"
+            % self.flux_load_seconds
         )
 
     def _run_flux(
@@ -850,9 +889,18 @@ class InpaintingEngine(object):
         save_exact_mask_path: Optional[Path] = None,
         save_intervention_mask_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
+        total_start = time.perf_counter()
+
+        source_load_start = time.perf_counter()
         source = Image.open(
             source_path
         ).convert("RGB")
+        source_load_seconds = (
+            time.perf_counter()
+            - source_load_start
+        )
+
+        preprocess_start = time.perf_counter()
 
         exact_pixels = int(
             np.count_nonzero(
@@ -1051,6 +1099,12 @@ class InpaintingEngine(object):
             inpaint_source = source
             inpaint_mask = mask
 
+        preprocess_seconds = (
+            time.perf_counter()
+            - preprocess_start
+        )
+
+        lama_start = time.perf_counter()
         if self.backend in (
             "flux_fill",
             "lama_only",
@@ -1072,11 +1126,18 @@ class InpaintingEngine(object):
                 ),
             )
 
+        lama_seconds = (
+            time.perf_counter()
+            - lama_start
+        )
+
         refine_mode = str(
             self.inpaint_cfg[
                 "flux_refine_mode"
             ]
         )
+
+        flux_seconds = 0.0
 
         if (
             self.backend == "flux_fill"
@@ -1133,10 +1194,15 @@ class InpaintingEngine(object):
                     "prompt_override"
                 ),
             )
+            flux_start = time.perf_counter()
             flux_local = self._run_flux(
                 lama_local,
                 flux_mask_local,
                 prompt,
+            )
+            flux_seconds = (
+                time.perf_counter()
+                - flux_start
             )
         else:
             prompt = removal_prompt_for_class(
@@ -1146,6 +1212,8 @@ class InpaintingEngine(object):
                 ),
             )
             flux_local = lama_local
+
+        postprocess_start = time.perf_counter()
 
         if local_crop_enabled:
             lama_full = (
@@ -1186,6 +1254,12 @@ class InpaintingEngine(object):
                 % outside_changed
             )
 
+        postprocess_seconds = (
+            time.perf_counter()
+            - postprocess_start
+        )
+
+        output_save_start = time.perf_counter()
         output_path.parent.mkdir(
             parents=True,
             exist_ok=True,
@@ -1195,8 +1269,14 @@ class InpaintingEngine(object):
             format="PNG",
             optimize=True,
         )
+        output_save_seconds = (
+            time.perf_counter()
+            - output_save_start
+        )
 
+        debug_save_seconds = 0.0
         if diagnostic_path is not None:
+            debug_save_start = time.perf_counter()
             save_inpainting_diagnostic(
                 source=source,
                 mask=mask,
@@ -1205,6 +1285,15 @@ class InpaintingEngine(object):
                 counterfactual=counterfactual,
                 out_path=diagnostic_path,
             )
+            debug_save_seconds = (
+                time.perf_counter()
+                - debug_save_start
+            )
+
+        total_seconds = (
+            time.perf_counter()
+            - total_start
+        )
 
         return {
             "exact_mask_pixels": exact_pixels,
@@ -1250,6 +1339,32 @@ class InpaintingEngine(object):
                 outside_changed
             ),
             "prompt": prompt,
+            "performance": {
+                "total_seconds": float(
+                    total_seconds
+                ),
+                "source_image_load_seconds": float(
+                    source_load_seconds
+                ),
+                "preprocess_seconds": float(
+                    preprocess_seconds
+                ),
+                "lama_seconds": float(
+                    lama_seconds
+                ),
+                "flux_seconds": float(
+                    flux_seconds
+                ),
+                "postprocess_seconds": float(
+                    postprocess_seconds
+                ),
+                "output_save_seconds": float(
+                    output_save_seconds
+                ),
+                "debug_save_seconds": float(
+                    debug_save_seconds
+                ),
+            },
         }
 
     def close(self) -> None:

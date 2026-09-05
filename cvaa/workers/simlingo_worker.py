@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import traceback
 from collections import defaultdict
 from pathlib import Path
@@ -72,7 +73,28 @@ def _group_by_frame(
     return [groups[frame] for frame in order]
 
 
+
+def _add_timing(
+    accumulator: Dict[str, float],
+    timing: Dict[str, Any],
+) -> None:
+    """累加一次 OfficialSimLingoRunner.infer 的性能字段。"""
+    for key in (
+        "total_seconds",
+        "rgb_load_seconds",
+        "input_build_seconds",
+        "model_forward_seconds",
+    ):
+        accumulator[key] = (
+            float(accumulator.get(key, 0.0))
+            + float(timing.get(key, 0.0) or 0.0)
+        )
+
+
+
 def main() -> int:
+    worker_start = time.perf_counter()
+
     if len(sys.argv) != 3:
         print(
             "内部 worker 用法错误：simlingo_worker.py <request.json> <result.json>",
@@ -103,6 +125,15 @@ def main() -> int:
     scores: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
 
+    original_timing: Dict[str, float] = {}
+    counterfactual_timing: Dict[str, float] = {}
+    original_inference_count = 0
+    counterfactual_inference_count = 0
+    measurement_load_seconds = 0.0
+    gt_prepare_seconds = 0.0
+    metric_seconds = 0.0
+    debug_seconds = 0.0
+
     try:
         print(
             "[SIMLINGO] loading Original SimLingo once for route=%s"
@@ -110,6 +141,7 @@ def main() -> int:
             flush=True,
         )
 
+        runner_init_start = time.perf_counter()
         runner = OfficialSimLingoRunner(
             cfg=cfg,
             official_root=Path(
@@ -125,6 +157,10 @@ def main() -> int:
                 )
                 else None
             ),
+        )
+        runner_init_seconds = (
+            time.perf_counter()
+            - runner_init_start
         )
 
         total_items = len(items)
@@ -143,11 +179,16 @@ def main() -> int:
             frame = str(frame_items[0]["frame"])
 
             try:
+                measurement_start = time.perf_counter()
                 measurement, measurement_path = (
                     load_measurement(
                         route_dir,
                         frame,
                     )
+                )
+                measurement_load_seconds += (
+                    time.perf_counter()
+                    - measurement_start
                 )
 
                 (
@@ -158,6 +199,11 @@ def main() -> int:
                         frame_items[0]["source_image"]
                     ),
                     measurement=measurement,
+                )
+                original_inference_count += 1
+                _add_timing(
+                    original_timing,
+                    runner.last_timing,
                 )
 
             except Exception as exc:
@@ -176,6 +222,7 @@ def main() -> int:
                 continue
 
             gt_waypoints = None
+            gt_start = time.perf_counter()
             if (
                 bool(cfg["debug"]["enabled"])
                 and bool(
@@ -202,6 +249,10 @@ def main() -> int:
                     )
                 except Exception:
                     gt_waypoints = None
+            gt_prepare_seconds += (
+                time.perf_counter()
+                - gt_start
+            )
 
             for item in frame_items:
                 actor_id = str(item["actor_id"])
@@ -233,6 +284,11 @@ def main() -> int:
                         ),
                         measurement=measurement,
                     )
+                    counterfactual_inference_count += 1
+                    _add_timing(
+                        counterfactual_timing,
+                        runner.last_timing,
+                    )
 
                     if (
                         context_signature(
@@ -244,6 +300,7 @@ def main() -> int:
                             "非视觉输入一致性检查失败。"
                         )
 
+                    metric_start = time.perf_counter()
                     route_metric = compute_metric_pair(
                         original_prediction.get(
                             "pred_route"
@@ -269,6 +326,11 @@ def main() -> int:
                             ),
                             "pred_speed_wps",
                         )
+
+                    metric_seconds += (
+                        time.perf_counter()
+                        - metric_start
+                    )
 
                     evaluated_counter += 1
                     waypoint_debug_path = None
@@ -303,6 +365,7 @@ def main() -> int:
                             )
                         )
 
+                        debug_start = time.perf_counter()
                         save_paired_waypoint_debug(
                             output_path=waypoint_debug_path,
                             source_image=Path(
@@ -322,6 +385,10 @@ def main() -> int:
                             gt_waypoints=gt_waypoints,
                             frame=frame,
                             actor_id=actor_id,
+                        )
+                        debug_seconds += (
+                            time.perf_counter()
+                            - debug_start
                         )
 
                     final_cf_path = None
@@ -504,6 +571,120 @@ def main() -> int:
         import transformers
         import accelerate
 
+        original_total = float(
+            original_timing.get(
+                "total_seconds",
+                0.0,
+            )
+        )
+        counterfactual_total = float(
+            counterfactual_timing.get(
+                "total_seconds",
+                0.0,
+            )
+        )
+
+        performance = {
+            "worker_wall_seconds": float(
+                time.perf_counter()
+                - worker_start
+            ),
+            "runner_init_seconds": float(
+                runner_init_seconds
+            ),
+            "runner_reported_init_seconds": float(
+                getattr(
+                    runner,
+                    "init_total_seconds",
+                    0.0,
+                )
+            ),
+            "source_guard_seconds": float(
+                getattr(
+                    runner,
+                    "source_guard_seconds",
+                    0.0,
+                )
+            ),
+            "model_load_seconds": float(
+                getattr(
+                    runner,
+                    "model_load_seconds",
+                    0.0,
+                )
+            ),
+            "measurement_load_seconds": float(
+                measurement_load_seconds
+            ),
+            "gt_prepare_seconds": float(
+                gt_prepare_seconds
+            ),
+            "original_inference_count": int(
+                original_inference_count
+            ),
+            "original_inference_total_seconds":
+                original_total,
+            "original_inference_avg_seconds": (
+                original_total
+                / original_inference_count
+                if original_inference_count > 0
+                else 0.0
+            ),
+            "original_rgb_load_total_seconds": float(
+                original_timing.get(
+                    "rgb_load_seconds",
+                    0.0,
+                )
+            ),
+            "original_input_build_total_seconds": float(
+                original_timing.get(
+                    "input_build_seconds",
+                    0.0,
+                )
+            ),
+            "original_model_forward_total_seconds": float(
+                original_timing.get(
+                    "model_forward_seconds",
+                    0.0,
+                )
+            ),
+            "counterfactual_inference_count": int(
+                counterfactual_inference_count
+            ),
+            "counterfactual_inference_total_seconds":
+                counterfactual_total,
+            "counterfactual_inference_avg_seconds": (
+                counterfactual_total
+                / counterfactual_inference_count
+                if counterfactual_inference_count > 0
+                else 0.0
+            ),
+            "counterfactual_rgb_load_total_seconds": float(
+                counterfactual_timing.get(
+                    "rgb_load_seconds",
+                    0.0,
+                )
+            ),
+            "counterfactual_input_build_total_seconds": float(
+                counterfactual_timing.get(
+                    "input_build_seconds",
+                    0.0,
+                )
+            ),
+            "counterfactual_model_forward_total_seconds": float(
+                counterfactual_timing.get(
+                    "model_forward_seconds",
+                    0.0,
+                )
+            ),
+            "metric_total_seconds": float(
+                metric_seconds
+            ),
+            "debug_total_seconds": float(
+                debug_seconds
+            ),
+        }
+
         payload = {
             "status": "complete",
             "worker": "simlingo",
@@ -519,11 +700,54 @@ def main() -> int:
             ),
             "source_info": runner.source_info,
             "config_path": str(runner.config_path),
+            "performance": performance,
             "evaluated_counter_end":
                 evaluated_counter,
             "scores": scores,
             "failures": failures,
         }
+        print(
+            "[PERF][SIMLINGO] worker=%.3fs load=%.3fs "
+            "orig=%.3fs (%.3fs/frame) "
+            "cf=%.3fs (%.3fs/actor) "
+            "model_forward(orig+cf)=%.3fs metric=%.3fs debug=%.3fs"
+            % (
+                performance[
+                    "worker_wall_seconds"
+                ],
+                performance[
+                    "model_load_seconds"
+                ],
+                performance[
+                    "original_inference_total_seconds"
+                ],
+                performance[
+                    "original_inference_avg_seconds"
+                ],
+                performance[
+                    "counterfactual_inference_total_seconds"
+                ],
+                performance[
+                    "counterfactual_inference_avg_seconds"
+                ],
+                (
+                    performance[
+                        "original_model_forward_total_seconds"
+                    ]
+                    + performance[
+                        "counterfactual_model_forward_total_seconds"
+                    ]
+                ),
+                performance[
+                    "metric_total_seconds"
+                ],
+                performance[
+                    "debug_total_seconds"
+                ],
+            ),
+            flush=True,
+        )
+
         _write_json(result_path, payload)
         return 0
 

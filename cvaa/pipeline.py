@@ -570,6 +570,7 @@ def process_route(
     envs: Dict[str, Path],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     route_start = time.time()
+    route_perf_start = time.perf_counter()
     route_id = route_output.name
 
     skip, existing_scores = (
@@ -605,11 +606,16 @@ def process_route(
         / "skipped_interventions.jsonl"
     )
 
+    matching_start = time.perf_counter()
     work_items, matching_summary = (
         match_route_actors(
             route_dir,
             cfg,
         )
+    )
+    matching_seconds = (
+        time.perf_counter()
+        - matching_start
     )
 
     print(
@@ -626,6 +632,7 @@ def process_route(
 
     valid_work: List[Dict[str, Any]] = []
     skipped_count = 0
+    prefilter_start = time.perf_counter()
 
     # Pre-filter before loading large generative models. Decode each instance
     # frame once, validate all matched actors in that frame, then immediately
@@ -728,6 +735,11 @@ def process_route(
                     },
                 )
 
+    prefilter_seconds = (
+        time.perf_counter()
+        - prefilter_start
+    )
+
     actor_scores: List[
         Dict[str, Any]
     ] = []
@@ -791,6 +803,18 @@ def process_route(
     fill_worker_launches = 0
     simlingo_worker_launches = 0
 
+    route_cache_prepare_seconds = 0.0
+    inpaint_phase_wall_seconds = 0.0
+    simlingo_phase_wall_seconds = 0.0
+    inpaint_worker_performance: Dict[
+        str,
+        Any,
+    ] = {}
+    simlingo_worker_performance: Dict[
+        str,
+        Any,
+    ] = {}
+
     if valid_work:
         with tempfile.TemporaryDirectory(
             prefix="cvaa_route_",
@@ -808,6 +832,10 @@ def process_route(
                     len(valid_work),
                     tmp_dir,
                 )
+            )
+
+            route_cache_prepare_start = (
+                time.perf_counter()
             )
 
             # ==========================================================
@@ -991,6 +1019,11 @@ def process_route(
                         )
                     )
 
+            route_cache_prepare_seconds = (
+                time.perf_counter()
+                - route_cache_prepare_start
+            )
+
             # ==========================================================
             # Phase B：整条 route 只启动一次 cvaa_fill worker。
             # ==========================================================
@@ -1029,6 +1062,9 @@ def process_route(
 
                 fill_worker_launches += 1
 
+                inpaint_phase_start = (
+                    time.perf_counter()
+                )
                 inpaint_payload = _run_worker(
                     python_executable=envs[
                         "cvaa_fill_python"
@@ -1040,6 +1076,16 @@ def process_route(
                     request_path=inpaint_request_path,
                     result_path=inpaint_result_path,
                     worker_name="cvaa_fill",
+                )
+                inpaint_phase_wall_seconds = (
+                    time.perf_counter()
+                    - inpaint_phase_start
+                )
+                inpaint_worker_performance = (
+                    inpaint_payload.get(
+                        "performance"
+                    )
+                    or {}
                 )
 
                 request_index = {
@@ -1199,6 +1245,9 @@ def process_route(
 
                 simlingo_worker_launches += 1
 
+                simlingo_phase_start = (
+                    time.perf_counter()
+                )
                 sim_payload = _run_worker(
                     python_executable=envs[
                         "simlingo_python"
@@ -1210,6 +1259,16 @@ def process_route(
                     request_path=sim_request_path,
                     result_path=sim_result_path,
                     worker_name="simlingo",
+                )
+                simlingo_phase_wall_seconds = (
+                    time.perf_counter()
+                    - simlingo_phase_start
+                )
+                simlingo_worker_performance = (
+                    sim_payload.get(
+                        "performance"
+                    )
+                    or {}
                 )
 
                 simlingo_source_info = (
@@ -1283,6 +1342,8 @@ def process_route(
             # 若 output.save_counterfactual_images / save_masks 为 true，
             # 对应用户明确要求永久保存的文件不在该临时目录中，不会被删除。
 
+    postprocess_start = time.perf_counter()
+
     frame_rankings = rank_actor_scores(
         actor_scores
     )
@@ -1311,6 +1372,64 @@ def process_route(
         frame_rankings,
     )
 
+    postprocess_seconds = (
+        time.perf_counter()
+        - postprocess_start
+    )
+    route_total_seconds = (
+        time.perf_counter()
+        - route_perf_start
+    )
+
+    performance = {
+        "route_total_seconds": float(
+            route_total_seconds
+        ),
+        "matching_seconds": float(
+            matching_seconds
+        ),
+        "mask_prefilter_seconds": float(
+            prefilter_seconds
+        ),
+        "route_cache_prepare_seconds": float(
+            route_cache_prepare_seconds
+        ),
+        "inpainting_phase_wall_seconds": float(
+            inpaint_phase_wall_seconds
+        ),
+        "simlingo_phase_wall_seconds": float(
+            simlingo_phase_wall_seconds
+        ),
+        "postprocess_seconds": float(
+            postprocess_seconds
+        ),
+        "inpainting_phase_percent": (
+            100.0
+            * inpaint_phase_wall_seconds
+            / route_total_seconds
+            if route_total_seconds > 0
+            else 0.0
+        ),
+        "simlingo_phase_percent": (
+            100.0
+            * simlingo_phase_wall_seconds
+            / route_total_seconds
+            if route_total_seconds > 0
+            else 0.0
+        ),
+        "cvaa_fill_worker":
+            inpaint_worker_performance,
+        "simlingo_worker":
+            simlingo_worker_performance,
+    }
+
+    # 单独保存，之后只需要把这个文件发回来即可分析瓶颈。
+    _json_dump(
+        route_output
+        / "performance.json",
+        performance,
+    )
+
     summary = {
         "status": "complete",
         "route_id": route_id,
@@ -1318,6 +1437,7 @@ def process_route(
         "elapsed_seconds": (
             time.time() - route_start
         ),
+        "performance": performance,
         "matching": matching_summary,
         "matched_work_items": len(
             work_items
@@ -1401,6 +1521,42 @@ def process_route(
         route_output
         / "summary.json",
         summary,
+    )
+
+    print(
+        "[PERF][ROUTE] total=%.3fs | match=%.3fs | "
+        "mask=%.3fs | cache=%.3fs | "
+        "inpaint=%.3fs (%.1f%%) | "
+        "simlingo=%.3fs (%.1f%%) | post=%.3fs"
+        % (
+            performance[
+                "route_total_seconds"
+            ],
+            performance[
+                "matching_seconds"
+            ],
+            performance[
+                "mask_prefilter_seconds"
+            ],
+            performance[
+                "route_cache_prepare_seconds"
+            ],
+            performance[
+                "inpainting_phase_wall_seconds"
+            ],
+            performance[
+                "inpainting_phase_percent"
+            ],
+            performance[
+                "simlingo_phase_wall_seconds"
+            ],
+            performance[
+                "simlingo_phase_percent"
+            ],
+            performance[
+                "postprocess_seconds"
+            ],
+        )
     )
 
     print(
@@ -1611,6 +1767,63 @@ def run_pipeline(
         global_rankings,
     )
 
+    performance_routes = [
+        summary.get(
+            "performance",
+            {},
+        )
+        for summary in route_summaries
+        if summary.get("performance")
+    ]
+    global_performance = {
+        "route_total_seconds_sum": float(
+            sum(
+                float(
+                    perf.get(
+                        "route_total_seconds",
+                        0.0,
+                    )
+                )
+                for perf in performance_routes
+            )
+        ),
+        "matching_seconds_sum": float(
+            sum(
+                float(
+                    perf.get(
+                        "matching_seconds",
+                        0.0,
+                    )
+                )
+                for perf in performance_routes
+            )
+        ),
+        "inpainting_phase_wall_seconds_sum":
+            float(
+                sum(
+                    float(
+                        perf.get(
+                            "inpainting_phase_wall_seconds",
+                            0.0,
+                        )
+                    )
+                    for perf in performance_routes
+                )
+            ),
+        "simlingo_phase_wall_seconds_sum":
+            float(
+                sum(
+                    float(
+                        perf.get(
+                            "simlingo_phase_wall_seconds",
+                            0.0,
+                        )
+                    )
+                    for perf in performance_routes
+                )
+            ),
+    }
+
     run_summary = {
         "status": (
             "complete"
@@ -1638,6 +1851,7 @@ def run_pipeline(
         "total_ranked_frames": len(
             global_rankings
         ),
+        "performance": global_performance,
         "output_root": str(
             output_root
         ),
