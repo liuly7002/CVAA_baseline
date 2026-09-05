@@ -1,0 +1,4 @@
+# Install these additions on TOP OF the official RenzKa/simlingo environment.
+# Official environment already pins torch==2.2.0, transformers==4.46.3,
+# accelerate==1.0.1, scipy, opencv, pillow, hydra-core, etc.
+diffusers==0.32.2

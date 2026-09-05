@@ -1,0 +1,214 @@
+# =============================================================================
+# CVAA baseline final batch configuration
+# Edit this file only. The runtime command is simply:
+#     python run_pipeline.py
+# =============================================================================
+
+paths:
+  # Root containing one or more CARLA route directories.
+  # A valid route must contain: instance_front/, boxes/, measurements/,
+  # surround_camera_config.json and rgb/ or rgb_front/.
+  routes_root: "/path/to/routes_root"
+
+  # Recursive glob under routes_root used to discover route directories.
+  route_glob: "**/Town*"
+
+  # Optional explicit route directories. If non-empty, these are used instead of
+  # routes_root + route_glob.
+  explicit_routes: []
+
+  # Final result root. Only compact final outputs and optional debug images are
+  # retained here. Large intermediate masks/counterfactual images are temporary.
+  output_root: "/path/to/cvaa_results"
+
+  # Clean checkout of the ORIGINAL RenzKa/simlingo repository.
+  official_simlingo_root: "/path/to/RenzKa/simlingo"
+
+  # Official SimLingo released state dict.
+  official_simlingo_checkpoint: "/path/to/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt"
+
+  # Official SimLingo training Hydra config. Set null to infer it from checkpoint.
+  official_simlingo_config: null
+
+  # Local FLUX.1-Fill-dev directory or Hugging Face model id.
+  flux_model: "/path/to/FLUX.1-Fill-dev"
+
+  # Local TorchScript LaMa model (big-lama.pt).
+  lama_model: "/path/to/big-lama.pt"
+
+  # Temporary cache root. Temporary counterfactual PNGs are deleted after each
+  # processing chunk. Set null to use the system temporary directory.
+  temp_root: null
+
+
+data:
+  # Maximum number of discovered routes to process. 0 = all.
+  max_routes: 0
+
+  # Frame selection. null start/end means full route.
+  frame_start: null
+  frame_end: null
+  frame_step: 1
+
+  # Maximum selected frames per route. 0 = all.
+  max_frames_per_route: 0
+
+  # Candidate actor classes included in the CVAA intervention.
+  include_static_obstacles: false
+
+
+matching:
+  # Minimum projected 2D box area before an actor is considered.
+  min_projected_area: 20
+
+  # Minimum compatible instance pixels overlapping the projected actor box.
+  min_overlap_pixels: 5
+
+  # Minimum actor-instance matching score.
+  min_score: 0.20
+
+  # Bonus when the same actor keeps the same image-side instance id over time.
+  temporal_bonus: 0.20
+
+  # Maximum selected-frame gap for applying temporal consistency bonus.
+  temporal_max_gap: 5
+
+
+mask:
+  # Minimum exact visible instance pixels before an intervention is allowed.
+  min_mask_pixels: 10
+
+  # Skip tiny objects whose exact visible bbox short side is below this value.
+  min_object_short_side_px: 12
+
+  # Additional stricter exact-mask size filter used by the final inpainting stage.
+  min_exact_mask_pixels: 80
+
+  # Adaptive dilation: radius = ratio * max(object bbox width, height), clipped
+  # to [adaptive_dilate_min_px, adaptive_dilate_max_px].
+  adaptive_dilate_ratio: 0.35
+  adaptive_dilate_min_px: 8
+  adaptive_dilate_max_px: 32
+
+
+inpainting:
+  # Final paper backend. "flux_fill" = LaMa removal + FLUX seam refinement.
+  # "lama_only" is useful for ablation; "opencv" is debug-only.
+  backend: "flux_fill"
+
+  # LaMa runs on CPU by default to reduce GPU memory pressure.
+  lama_device: "cpu"
+
+  # FLUX execution device.
+  device: "cuda"
+  dtype: "bfloat16"
+
+  # FLUX generation settings.
+  num_inference_steps: 28
+  guidance_scale: 30.0
+  max_sequence_length: 512
+  seed: 42
+
+  # Optional global prompt override. null = use class-specific removal prompts.
+  prompt_override: null
+
+  # Local crop magnifies small actors before inpainting.
+  local_crop_enabled: true
+  crop_context_scale: 8.0
+  crop_min_side_px: 192
+  crop_max_side_px: 512
+  crop_target_size: 512
+
+  # FLUX refinement after LaMa: "seam" is recommended; "full" lets FLUX modify
+  # the whole intervention region; "none" keeps LaMa only.
+  flux_refine_mode: "seam"
+  flux_seam_width_px: 6
+
+  # GPU-memory controls. For ~16 GB GPUs, sequential_cpu_offload=true is the
+  # recommended setting.
+  cpu_offload: false
+  sequential_cpu_offload: true
+  vae_tiling: true
+
+  # OpenCV fallback settings; only used when backend="opencv".
+  opencv_radius: 3.0
+  opencv_method: "telea"
+
+
+simlingo:
+  # Device used by the original SimLingo model.
+  device: "cuda"
+
+  # Reproducibility seed. Official inference is greedy, but the seed is still
+  # fixed to remove avoidable stochasticity.
+  seed: 42
+
+  # Whether to save generated language text in final actor records.
+  save_language: false
+
+  # Saved route RGB is already JPEG-encoded. Keep false for the final baseline
+  # to avoid an unnecessary second JPEG round-trip.
+  emulate_online_jpeg_roundtrip: false
+  jpeg_quality: 95
+
+  # Reject modified SimLingo source trees. Keep false for the final experiment.
+  allow_nonofficial_tree: false
+
+
+runtime:
+  # Resource-safe processing unit. A chunk never splits one frame. The pipeline
+  # first creates temporary counterfactuals for at most this many actors, unloads
+  # the inpainting models, loads SimLingo, evaluates them, then deletes the temp
+  # images. Larger values reduce model reload overhead but use more temporary disk.
+  max_counterfactuals_per_chunk: 16
+
+  # If true, a route with final summary status="complete" is skipped on rerun.
+  resume_completed_routes: true
+
+  # If a previous route output is incomplete, delete/rebuild it rather than
+  # mixing partial results from different runs.
+  rebuild_incomplete_routes: true
+
+  # Print a short progress line every N evaluated actors.
+  progress_every: 1
+
+
+debug:
+  # Master debug switch.
+  enabled: true
+
+  # Save one debug image every N evaluated actor interventions.
+  every_n_actors: 20
+
+  # Final debug layout is compact:
+  # LEFT  = original RGB + original predicted future waypoints + GT
+  # RIGHT = counterfactual RGB + counterfactual predicted future waypoints + GT
+  # RED = prediction, GREEN = ground truth.
+  save_waypoint_comparison: true
+
+  # Optional five-panel inpainting diagnostic:
+  # original | mask | LaMa | FLUX | final counterfactual.
+  # Keep false for large batch runs to save disk space.
+  save_inpainting_diagnostic: false
+
+
+output:
+  # Save final counterfactual images permanently. Keep false for low-disk batch
+  # processing; counterfactuals are still generated temporarily for inference.
+  save_counterfactual_images: false
+
+  # Save exact/intervention masks permanently. Keep false for low-disk runs.
+  save_masks: false
+
+  # Save predicted/original/counterfactual trajectory arrays in actor_scores.jsonl.
+  # false keeps final output compact while preserving AD/FD and ranking.
+  save_trajectories: false
+
+  # Supplementary diagnostic AD/FD on pred_speed_wps. This NEVER changes the
+  # formal CVAA ranking, which always uses pred_route.
+  include_speed_wps_diagnostic: true
+
+  # Formal CVAA ranking rule: AD descending, then FD descending.
+  strict_original_consistency: true
+  original_consistency_atol: 1.0e-7
+  original_consistency_rtol: 1.0e-7

@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+.DS_Store
+
+# Local models / credentials
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+.env
+
+# Runtime outputs and temporary cache
+outputs/
+cvaa_results/
+tmp/
+temp/
+
+# Large local data
+database/
+data/
