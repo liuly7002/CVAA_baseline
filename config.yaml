@@ -89,8 +89,14 @@ paths:
   lama_model: "/home/kemove/models/LAMA/big-lama.pt"
 
   # 临时缓存根目录。
-  # 当前 chunk 的反事实图会临时保存在这里，并在该 chunk 完成后自动删除。
-  # 设置为 null 时使用系统临时目录。
+  #
+  # 最终加速版以“整条 route”为处理单位：
+  #   1. cvaa_fill 一次性生成当前 route 的全部临时反事实图；
+  #   2. cvaa_fill 退出后，simlingo 一次性完成当前 route 的全部推理；
+  #   3. 当前 route 完成后，临时 mask / 反事实图 / worker IPC 文件全部自动删除。
+  #
+  # 因此这里需要能够临时容纳“一条 route”的反事实图，但不会随着整个数据集累积。
+  # 设置为 null 时使用系统临时目录；如果系统 /tmp 空间较小，建议填写容量更大的本地磁盘目录。
   temp_root: null
 
 
@@ -232,17 +238,14 @@ simlingo:
 
 
 runtime:
-  # 单个处理 chunk 中最多包含多少个 actor intervention。
+  # 最终加速版不再按 chunk 反复加载模型。
   #
-  # 一个 frame 不会被拆到两个 chunk 中。
-  # 程序先生成当前 chunk 的临时反事实图，再卸载 inpainting 模型，
-  # 加载 SimLingo 完成推理与 AD/FD，随后删除临时图。
+  # 对每一条 route：
+  #   cvaa_fill worker 只启动 1 次，LaMa / FLUX 只加载 1 次；
+  #   simlingo worker 只启动 1 次，Original SimLingo / checkpoint 只加载 1 次。
   #
-  # 数值越大：
-  #   模型重新加载次数越少，但临时磁盘占用越高。
-  # 数值越小：
-  #   临时磁盘占用越低，但模型重新加载次数越多。
-  max_counterfactuals_per_chunk: 16
+  # 代价是当前 route 的反事实图会在 temp_root 中临时共存，
+  # 但 route 完成后会自动删除，不会长期占用磁盘。
 
   # 若某条 route 已经存在 status="complete" 的最终 summary，重新运行时是否跳过。
   resume_completed_routes: true

@@ -7,12 +7,16 @@ Original SimLingo 独立推理 worker。
 本文件不由用户直接运行。
 主流程会使用 config.yaml 中解析出的 simlingo Python 自动启动本 worker。
 
-每个 chunk 中：
-    1. 同一 frame 的 original image 只推理一次；
-    2. 每个 actor 的 counterfactual image 分别推理；
-    3. 立即计算 pred_route 的 AD / FD；
-    4. 可选生成 prediction / GT debug 图；
-    5. worker 退出后，Original SimLingo 自动释放全部 GPU 显存。
+最终加速版中，本 worker 对“一整条 route”只启动一次：
+
+    1. Original SimLingo / checkpoint 只加载一次；
+    2. 同一 frame 的 original image 只推理一次；
+    3. 每个 actor 的 counterfactual image 分别推理；
+    4. 立即计算 pred_route 的 AD / FD；
+    5. 可选生成 prediction / GT debug 图；
+    6. 当前 route 全部完成后 worker 退出并释放 GPU。
+
+这样避免旧版本按 chunk 反复加载 2GB 以上的 checkpoint。
 """
 
 from __future__ import annotations
@@ -100,6 +104,12 @@ def main() -> int:
     failures: List[Dict[str, Any]] = []
 
     try:
+        print(
+            "[SIMLINGO] loading Original SimLingo once for route=%s"
+            % route_id,
+            flush=True,
+        )
+
         runner = OfficialSimLingoRunner(
             cfg=cfg,
             official_root=Path(
@@ -114,6 +124,18 @@ def main() -> int:
                     "official_simlingo_config"
                 )
                 else None
+            ),
+        )
+
+        total_items = len(items)
+        processed_items = 0
+        progress_every = max(
+            1,
+            int(
+                cfg["runtime"].get(
+                    "progress_every",
+                    1,
+                )
             ),
         )
 
@@ -183,6 +205,23 @@ def main() -> int:
 
             for item in frame_items:
                 actor_id = str(item["actor_id"])
+                processed_items += 1
+
+                if (
+                    processed_items == 1
+                    or processed_items == total_items
+                    or processed_items % progress_every == 0
+                ):
+                    print(
+                        "[SIMLINGO %d/%d] frame=%s actor=%s"
+                        % (
+                            processed_items,
+                            total_items,
+                            frame,
+                            actor_id,
+                        ),
+                        flush=True,
+                    )
 
                 try:
                     (
@@ -430,6 +469,24 @@ def main() -> int:
                             ]
 
                     scores.append(score)
+
+                    if (
+                        processed_items == 1
+                        or processed_items == total_items
+                        or processed_items % progress_every == 0
+                    ):
+                        print(
+                            "[SIMLINGO OK %d/%d] frame=%s actor=%s AD=%.6f FD=%.6f"
+                            % (
+                                processed_items,
+                                total_items,
+                                frame,
+                                actor_id,
+                                float(score["AD"]),
+                                float(score["FD"]),
+                            ),
+                            flush=True,
+                        )
 
                 except Exception as exc:
                     failures.append(

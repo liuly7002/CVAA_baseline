@@ -7,10 +7,14 @@ LaMa + FLUX 独立 worker。
 本文件不由用户直接运行。
 主流程会使用 config.yaml 中解析出的 cvaa_fill Python 自动启动本 worker。
 
-这样可以保证：
-    simlingo 环境不需要安装 diffusers；
-    cvaa_fill 环境不需要安装 Original SimLingo；
-    两套大模型不会同时驻留同一个 Python 进程。
+最终加速版中，本 worker 对“一整条 route”只启动一次：
+
+    1. LaMa / FLUX 只加载一次；
+    2. 连续生成当前 route 的全部反事实图；
+    3. 全部完成后 worker 退出，释放 GPU；
+    4. 主流程随后再启动 simlingo worker。
+
+这样既保持双环境隔离，又避免旧版本按 chunk 反复加载 FLUX。
 """
 
 from __future__ import annotations
@@ -74,9 +78,39 @@ def main() -> int:
             flux_model=str(request["flux_model"]),
         )
 
-        for item in items:
+        total_items = len(items)
+        progress_every = max(
+            1,
+            int(
+                cfg["runtime"].get(
+                    "progress_every",
+                    1,
+                )
+            ),
+        )
+
+        for item_index, item in enumerate(
+            items,
+            1,
+        ):
             frame = str(item["frame"])
             actor_id = str(item["actor_id"])
+
+            if (
+                item_index == 1
+                or item_index == total_items
+                or item_index % progress_every == 0
+            ):
+                print(
+                    "[INPAINT %d/%d] frame=%s actor=%s"
+                    % (
+                        item_index,
+                        total_items,
+                        frame,
+                        actor_id,
+                    ),
+                    flush=True,
+                )
 
             try:
                 exact_mask = cv2.imread(
@@ -123,6 +157,22 @@ def main() -> int:
                         "meta": meta,
                     }
                 )
+
+                if (
+                    item_index == 1
+                    or item_index == total_items
+                    or item_index % progress_every == 0
+                ):
+                    print(
+                        "[INPAINT OK %d/%d] frame=%s actor=%s"
+                        % (
+                            item_index,
+                            total_items,
+                            frame,
+                            actor_id,
+                        ),
+                        flush=True,
+                    )
 
             except SkipIntervention as exc:
                 results.append(

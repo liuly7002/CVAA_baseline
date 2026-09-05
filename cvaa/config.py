@@ -218,11 +218,6 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     # ------------------------------------------------------------------
     # Runtime / 数据范围
     # ------------------------------------------------------------------
-    if int(_require(cfg, "runtime.max_counterfactuals_per_chunk")) <= 0:
-        raise ValueError(
-            "runtime.max_counterfactuals_per_chunk must be > 0"
-        )
-
     if int(_require(cfg, "data.frame_step")) <= 0:
         raise ValueError("data.frame_step must be > 0")
 

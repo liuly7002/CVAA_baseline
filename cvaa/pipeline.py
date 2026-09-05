@@ -391,45 +391,6 @@ def _group_by_frame(
     ]
 
 
-def chunk_work_items(
-    work_items: List[Dict[str, Any]],
-    max_counterfactuals: int,
-) -> List[List[Dict[str, Any]]]:
-    """
-    Keep every frame intact. A frame containing more actors than the configured
-    limit becomes one oversized chunk rather than being split.
-    """
-    frame_groups = _group_by_frame(
-        work_items
-    )
-    chunks: List[
-        List[Dict[str, Any]]
-    ] = []
-    current: List[
-        Dict[str, Any]
-    ] = []
-
-    for frame_group in frame_groups:
-        if (
-            current
-            and len(current)
-            + len(frame_group)
-            > max_counterfactuals
-        ):
-            chunks.append(current)
-            current = []
-
-        current.extend(frame_group)
-
-        if len(current) >= max_counterfactuals:
-            chunks.append(current)
-            current = []
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
 
 def _prepare_route_output(
     route_output: Path,
@@ -767,15 +728,6 @@ def process_route(
                     },
                 )
 
-    chunks = chunk_work_items(
-        valid_work,
-        int(
-            cfg["runtime"][
-                "max_counterfactuals_per_chunk"
-            ]
-        ),
-    )
-
     actor_scores: List[
         Dict[str, Any]
     ] = []
@@ -800,34 +752,48 @@ def process_route(
         )
 
     # ------------------------------------------------------------------
-    # 双环境 chunk 流程
+    # 双环境 route 级加速流程
     #
-    # 主进程只负责：
-    #   1. 构造临时 exact mask；
-    #   2. 调用 cvaa_fill worker 生成当前 chunk 的反事实图；
-    #   3. cvaa_fill worker 退出后调用 simlingo worker；
-    #   4. 收集 AD / FD / debug 结果；
-    #   5. TemporaryDirectory 自动删除中间 mask / counterfactual image。
+    # 旧版本为了控制临时磁盘占用，把一条 route 切成多个 chunk：
     #
-    # 因为两个 worker 都是独立子进程，所以 worker 退出时 GPU 显存会由
-    # 操作系统/CUDA runtime 完整释放，不再依赖同一 Python 进程内的
-    # gc.collect() 或 torch.cuda.empty_cache()。
+    #     chunk 1: 加载 FLUX -> 推理 -> 退出 -> 加载 SimLingo -> 推理 -> 退出
+    #     chunk 2: 加载 FLUX -> 推理 -> 退出 -> 加载 SimLingo -> 推理 -> 退出
+    #     ...
+    #
+    # 对一条含数百个 actor 的 route，这会反复加载 FLUX 和 2.57GB 左右的
+    # SimLingo checkpoint，模型初始化时间会被重复很多次。
+    #
+    # 当前版本改为：
+    #
+    #     当前 route
+    #         ↓
+    #     cvaa_fill worker 启动 1 次
+    #         ↓
+    #     LaMa / FLUX 加载 1 次
+    #         ↓
+    #     生成当前 route 的全部临时反事实图
+    #         ↓
+    #     cvaa_fill worker 退出并释放 GPU
+    #         ↓
+    #     simlingo worker 启动 1 次
+    #         ↓
+    #     Original SimLingo / checkpoint 加载 1 次
+    #         ↓
+    #     对当前 route 的所有原图/反事实图完成推理、AD/FD、debug
+    #         ↓
+    #     simlingo worker 退出
+    #         ↓
+    #     TemporaryDirectory 自动删除当前 route 的全部临时文件
+    #
+    # 这样保持“双环境隔离”和“中间文件不长期保存”两个原则不变，
+    # 但把每条 route 的 FLUX / SimLingo 加载次数从 N 个 chunk 降为 1 次。
     # ------------------------------------------------------------------
-    for chunk_index, chunk in enumerate(
-        chunks,
-        1,
-    ):
-        print(
-            "[CHUNK %d/%d] actors=%d"
-            % (
-                chunk_index,
-                len(chunks),
-                len(chunk),
-            )
-        )
+    fill_worker_launches = 0
+    simlingo_worker_launches = 0
 
+    if valid_work:
         with tempfile.TemporaryDirectory(
-            prefix="cvaa_chunk_",
+            prefix="cvaa_route_",
             dir=(
                 str(temp_root)
                 if temp_root is not None
@@ -836,8 +802,19 @@ def process_route(
         ) as tmp:
             tmp_dir = Path(tmp)
 
+            print(
+                "[ROUTE CACHE] valid actors=%d, temporary directory=%s"
+                % (
+                    len(valid_work),
+                    tmp_dir,
+                )
+            )
+
             # ==========================================================
-            # Phase A：在主进程中只准备轻量临时 mask。
+            # Phase A：为整条 route 准备临时 exact mask 和 worker 请求。
+            #
+            # exact mask 是很小的 PNG，只作为跨 Conda 环境 IPC 使用。
+            # route 完成后会与临时反事实图一起自动删除。
             # ==========================================================
             inpaint_request_items: List[
                 Dict[str, Any]
@@ -847,7 +824,7 @@ def process_route(
             cached_semantic = None
             cached_instance16 = None
 
-            for item in chunk:
+            for item in valid_work:
                 frame = str(item["frame"])
                 actor_id = str(item["actor_id"])
 
@@ -870,8 +847,6 @@ def process_route(
                         cached_instance16,
                     )
 
-                    # exact mask 仅作为当前 chunk 的临时 IPC 文件。
-                    # chunk 结束后会与临时反事实图一起自动删除。
                     temp_mask_path = (
                         tmp_dir
                         / "exact_masks"
@@ -882,6 +857,7 @@ def process_route(
                         parents=True,
                         exist_ok=True,
                     )
+
                     ok = cv2.imwrite(
                         str(temp_mask_path),
                         exact_mask,
@@ -892,6 +868,8 @@ def process_route(
                             % temp_mask_path
                         )
 
+                    # 如果用户明确要求永久保存反事实图，则直接写到 route_output。
+                    # 否则写到当前 route 的临时目录，SimLingo 推理结束后自动删除。
                     if bool(
                         cfg["output"][
                             "save_counterfactual_images"
@@ -907,14 +885,13 @@ def process_route(
                         cf_path = (
                             tmp_dir
                             / "counterfactuals"
-                            / (
-                                "%s_actor_%s.png"
-                                % (frame, actor_id)
-                            )
+                            / frame
+                            / ("actor_%s.png" % actor_id)
                         )
 
                     exact_mask_path = None
                     intervention_mask_path = None
+
                     if bool(
                         cfg["output"]["save_masks"]
                     ):
@@ -935,6 +912,7 @@ def process_route(
 
                     inpainting_debug_counter += 1
                     diagnostic_path = None
+
                     if (
                         bool(cfg["debug"]["enabled"])
                         and bool(
@@ -1004,269 +982,306 @@ def process_route(
                             "error": repr(exc),
                         },
                     )
-
-            if not inpaint_request_items:
-                continue
+                    print(
+                        "[PREPARE ERROR] frame=%s actor=%s: %s"
+                        % (
+                            frame,
+                            actor_id,
+                            exc,
+                        )
+                    )
 
             # ==========================================================
-            # Phase B：cvaa_fill 环境生成反事实图。
+            # Phase B：整条 route 只启动一次 cvaa_fill worker。
             # ==========================================================
-            inpaint_request_path = (
-                tmp_dir / "inpaint_request.json"
-            )
-            inpaint_result_path = (
-                tmp_dir / "inpaint_result.json"
-            )
-
-            _write_json(
-                inpaint_request_path,
-                {
-                    "config":
-                        _effective_config(cfg),
-                    "lama_model_path":
-                        str(paths["lama_model"]),
-                    "flux_model":
-                        str(
-                            cfg["paths"]["flux_model"]
-                        ),
-                    "items":
-                        inpaint_request_items,
-                },
-            )
-
-            inpaint_payload = _run_worker(
-                python_executable=envs[
-                    "cvaa_fill_python"
-                ],
-                worker_script=(
-                    WORKER_DIR
-                    / "inpaint_worker.py"
-                ),
-                request_path=inpaint_request_path,
-                result_path=inpaint_result_path,
-                worker_name="cvaa_fill",
-            )
-
             generated_items: List[
                 Dict[str, Any]
             ] = []
 
-            # 用 frame+actor 重新索引 request，
-            # 把 worker 返回的 meta 与原始 actor 信息合并。
-            request_index = {
-                (
-                    str(x["frame"]),
-                    str(x["actor_id"]),
-                ): x
-                for x in inpaint_request_items
-            }
+            if inpaint_request_items:
+                print(
+                    "[INPAINT PHASE] start one cvaa_fill worker for %d actors"
+                    % len(inpaint_request_items)
+                )
 
-            for result in inpaint_payload.get(
-                "results",
-                [],
-            ):
-                frame = str(result["frame"])
-                actor_id = str(result["actor_id"])
-                key = (frame, actor_id)
-                original_item = request_index[key]
+                inpaint_request_path = (
+                    tmp_dir / "inpaint_request.json"
+                )
+                inpaint_result_path = (
+                    tmp_dir / "inpaint_result.json"
+                )
 
-                if result["status"] == "ok":
-                    meta = result.get("meta") or {}
-                    generated_counterfactuals += 1
-                    generated_items.append(
-                        {
-                            **original_item,
-                            **meta,
-                            "counterfactual_image":
-                                original_item[
-                                    "counterfactual_image"
-                                ],
-                        }
+                _write_json(
+                    inpaint_request_path,
+                    {
+                        "config":
+                            _effective_config(cfg),
+                        "lama_model_path":
+                            str(paths["lama_model"]),
+                        "flux_model":
+                            str(
+                                cfg["paths"]["flux_model"]
+                            ),
+                        "items":
+                            inpaint_request_items,
+                    },
+                )
+
+                fill_worker_launches += 1
+
+                inpaint_payload = _run_worker(
+                    python_executable=envs[
+                        "cvaa_fill_python"
+                    ],
+                    worker_script=(
+                        WORKER_DIR
+                        / "inpaint_worker.py"
+                    ),
+                    request_path=inpaint_request_path,
+                    result_path=inpaint_result_path,
+                    worker_name="cvaa_fill",
+                )
+
+                request_index = {
+                    (
+                        str(x["frame"]),
+                        str(x["actor_id"]),
+                    ): x
+                    for x in inpaint_request_items
+                }
+
+                for result in inpaint_payload.get(
+                    "results",
+                    [],
+                ):
+                    frame = str(result["frame"])
+                    actor_id = str(
+                        result["actor_id"]
+                    )
+                    key = (
+                        frame,
+                        actor_id,
+                    )
+                    original_item = (
+                        request_index[key]
                     )
 
-                elif result["status"] == "skip":
-                    skipped_count += 1
-                    _append_jsonl(
-                        skipped_path,
-                        {
-                            "frame": frame,
-                            "actor_id": actor_id,
-                            "reason": result.get(
-                                "reason"
-                            ),
-                        },
-                    )
-
-                else:
-                    inpainting_failures += 1
-                    _append_jsonl(
-                        failures_path,
-                        {
-                            "stage": "inpainting",
-                            "frame": frame,
-                            "actor_id": actor_id,
-                            "error": result.get(
-                                "error"
-                            ),
-                            "traceback": result.get(
-                                "traceback"
-                            ),
-                        },
-                    )
-                    print(
-                        "[INPAINT ERROR] frame=%s actor=%s: %s"
-                        % (
-                            frame,
-                            actor_id,
-                            result.get("error"),
+                    if result["status"] == "ok":
+                        meta = (
+                            result.get("meta")
+                            or {}
                         )
+                        generated_counterfactuals += 1
+
+                        generated_items.append(
+                            {
+                                **original_item,
+                                **meta,
+                                "counterfactual_image":
+                                    original_item[
+                                        "counterfactual_image"
+                                    ],
+                            }
+                        )
+
+                    elif result["status"] == "skip":
+                        skipped_count += 1
+                        _append_jsonl(
+                            skipped_path,
+                            {
+                                "frame": frame,
+                                "actor_id": actor_id,
+                                "reason":
+                                    result.get(
+                                        "reason"
+                                    ),
+                            },
+                        )
+
+                    else:
+                        inpainting_failures += 1
+                        _append_jsonl(
+                            failures_path,
+                            {
+                                "stage":
+                                    "inpainting",
+                                "frame": frame,
+                                "actor_id":
+                                    actor_id,
+                                "error":
+                                    result.get(
+                                        "error"
+                                    ),
+                                "traceback":
+                                    result.get(
+                                        "traceback"
+                                    ),
+                            },
+                        )
+                        print(
+                            "[INPAINT ERROR] frame=%s actor=%s: %s"
+                            % (
+                                frame,
+                                actor_id,
+                                result.get(
+                                    "error"
+                                ),
+                            )
+                        )
+
+                print(
+                    "[INPAINT PHASE] finished: generated=%d, failed=%d, skipped=%d"
+                    % (
+                        len(generated_items),
+                        inpainting_failures,
+                        skipped_count,
                     )
-
-            if not generated_items:
-                continue
+                )
 
             # ==========================================================
-            # Phase C：cvaa_fill 子进程已经退出。
-            # 此时再启动 simlingo 环境进行 Original SimLingo 推理。
+            # Phase C：cvaa_fill 已退出，GPU 已释放。
+            # 整条 route 只启动一次 simlingo worker。
             # ==========================================================
-            sim_request_path = (
-                tmp_dir / "simlingo_request.json"
-            )
-            sim_result_path = (
-                tmp_dir / "simlingo_result.json"
-            )
+            if generated_items:
+                print(
+                    "[SIMLINGO PHASE] start one simlingo worker for %d actors"
+                    % len(generated_items)
+                )
 
-            _write_json(
-                sim_request_path,
-                {
-                    "config":
-                        _effective_config(cfg),
-                    "route_dir":
-                        str(route_dir),
-                    "route_output":
-                        str(route_output),
-                    "route_id":
-                        route_id,
-                    "official_simlingo_root":
-                        str(
-                            paths[
-                                "official_simlingo_root"
-                            ]
-                        ),
-                    "official_simlingo_checkpoint":
-                        str(
-                            paths[
-                                "official_simlingo_checkpoint"
-                            ]
-                        ),
-                    "official_simlingo_config": (
-                        str(
-                            paths[
+                sim_request_path = (
+                    tmp_dir / "simlingo_request.json"
+                )
+                sim_result_path = (
+                    tmp_dir / "simlingo_result.json"
+                )
+
+                _write_json(
+                    sim_request_path,
+                    {
+                        "config":
+                            _effective_config(cfg),
+                        "route_dir":
+                            str(route_dir),
+                        "route_output":
+                            str(route_output),
+                        "route_id":
+                            route_id,
+                        "official_simlingo_root":
+                            str(
+                                paths[
+                                    "official_simlingo_root"
+                                ]
+                            ),
+                        "official_simlingo_checkpoint":
+                            str(
+                                paths[
+                                    "official_simlingo_checkpoint"
+                                ]
+                            ),
+                        "official_simlingo_config": (
+                            str(
+                                paths[
+                                    "official_simlingo_config"
+                                ]
+                            )
+                            if paths[
                                 "official_simlingo_config"
                             ]
-                        )
-                        if paths[
-                            "official_simlingo_config"
-                        ]
-                        is not None
-                        else None
+                            is not None
+                            else None
+                        ),
+                        "evaluated_counter_start":
+                            evaluated_counter,
+                        "items":
+                            generated_items,
+                    },
+                )
+
+                simlingo_worker_launches += 1
+
+                sim_payload = _run_worker(
+                    python_executable=envs[
+                        "simlingo_python"
+                    ],
+                    worker_script=(
+                        WORKER_DIR
+                        / "simlingo_worker.py"
                     ),
-                    "evaluated_counter_start":
-                        evaluated_counter,
-                    "items":
-                        generated_items,
-                },
-            )
+                    request_path=sim_request_path,
+                    result_path=sim_result_path,
+                    worker_name="simlingo",
+                )
 
-            sim_payload = _run_worker(
-                python_executable=envs[
-                    "simlingo_python"
-                ],
-                worker_script=(
-                    WORKER_DIR
-                    / "simlingo_worker.py"
-                ),
-                request_path=sim_request_path,
-                result_path=sim_result_path,
-                worker_name="simlingo",
-            )
-
-            if simlingo_source_info is None:
                 simlingo_source_info = (
-                    sim_payload.get("source_info")
+                    sim_payload.get(
+                        "source_info"
+                    )
                 )
                 simlingo_config_path = (
-                    sim_payload.get("config_path")
-                )
-
-            evaluated_counter = int(
-                sim_payload.get(
-                    "evaluated_counter_end",
-                    evaluated_counter,
-                )
-            )
-
-            new_scores = sim_payload.get(
-                "scores",
-                [],
-            )
-            actor_scores.extend(new_scores)
-
-            for failure in sim_payload.get(
-                "failures",
-                [],
-            ):
-                inference_failures += 1
-                _append_jsonl(
-                    failures_path,
-                    failure,
-                )
-                print(
-                    "[SIMLINGO ERROR] frame=%s actor=%s: %s"
-                    % (
-                        failure.get("frame"),
-                        failure.get("actor_id"),
-                        failure.get("error"),
+                    sim_payload.get(
+                        "config_path"
                     )
                 )
 
-            progress_every = int(
-                cfg["runtime"][
-                    "progress_every"
-                ]
-            )
-            if progress_every > 0:
-                for score in new_scores:
-                    # worker 已经完成指标计算，这里只负责统一打印结果。
-                    if (
-                        int(
-                            score.get(
-                                "_progress_index",
-                                0,
-                            )
-                            or 0
-                        )
-                        % progress_every
-                        == 0
-                    ):
-                        pass
+                evaluated_counter = int(
+                    sim_payload.get(
+                        "evaluated_counter_end",
+                        evaluated_counter,
+                    )
+                )
 
-                # 为保持原开发版终端风格，直接打印本 chunk 的成功结果。
-                for score in new_scores:
+                new_scores = (
+                    sim_payload.get(
+                        "scores",
+                        [],
+                    )
+                )
+                actor_scores.extend(
+                    new_scores
+                )
+
+                for failure in (
+                    sim_payload.get(
+                        "failures",
+                        [],
+                    )
+                ):
+                    inference_failures += 1
+                    _append_jsonl(
+                        failures_path,
+                        failure,
+                    )
                     print(
-                        "[OK] route=%s frame=%s actor=%s AD=%.6f FD=%.6f"
+                        "[SIMLINGO ERROR] frame=%s actor=%s: %s"
                         % (
-                            route_id,
-                            score["frame"],
-                            score["actor_id"],
-                            score["AD"],
-                            score["FD"],
+                            failure.get(
+                                "frame"
+                            ),
+                            failure.get(
+                                "actor_id"
+                            ),
+                            failure.get(
+                                "error"
+                            ),
                         )
                     )
 
-            # 退出 with TemporaryDirectory 后：
-            # 当前 chunk 的临时 exact mask、反事实图和 worker IPC JSON
-            # 会一起自动删除，不会长期占用本地磁盘。
+                print(
+                    "[SIMLINGO PHASE] finished: evaluated=%d, failures=%d"
+                    % (
+                        len(new_scores),
+                        inference_failures,
+                    )
+                )
+
+            # 离开 TemporaryDirectory 后：
+            #   - 临时 exact masks
+            #   - 临时 counterfactual images
+            #   - worker request/result JSON
+            # 全部一次性删除。
+            #
+            # 若 output.save_counterfactual_images / save_masks 为 true，
+            # 对应用户明确要求永久保存的文件不在该临时目录中，不会被删除。
 
     frame_rankings = rank_actor_scores(
         actor_scores
@@ -1310,7 +1325,16 @@ def process_route(
         "valid_interventions_after_mask_filter": len(
             valid_work
         ),
-        "chunks": len(chunks),
+        "execution_strategy": {
+            "unit": "route",
+            "cvaa_fill_worker_launches": (
+                fill_worker_launches
+            ),
+            "simlingo_worker_launches": (
+                simlingo_worker_launches
+            ),
+            "models_loaded_once_per_route": True,
+        },
         "generated_counterfactuals": (
             generated_counterfactuals
         ),
@@ -1356,7 +1380,7 @@ def process_route(
                     "save_trajectories"
                 ]
             ),
-            "temporary_chunk_cache_deleted": True,
+            "temporary_route_cache_deleted": True,
         },
         "official_simlingo": {
             "source_info": (
@@ -1632,8 +1656,9 @@ def run_pipeline(
         },
         "storage_policy": {
             "streamed_unified_pipeline": True,
-            "bounded_temporary_chunks": True,
-            "temporary_counterfactuals_deleted": True,
+            "route_level_temporary_cache": True,
+            "temporary_counterfactuals_deleted_after_each_route": True,
+            "models_loaded_once_per_route": True,
             "save_counterfactual_images": bool(
                 cfg["output"][
                     "save_counterfactual_images"
