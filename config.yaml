@@ -24,12 +24,55 @@ run:
   recursive: true
 
 
+# =============================================================================
+# Python 环境配置
+#
+# 最终版本采用“单入口 + 双环境 worker”：
+#
+#   simlingo 环境
+#       只负责 Original SimLingo 推理。
+#
+#   cvaa_fill 环境
+#       只负责 LaMa + FLUX 反事实图像生成。
+#
+# 用户仍然只需要执行：
+#       conda activate simlingo
+#       python run_pipeline.py
+#
+# 主程序会自动找到下面两个 Conda 环境对应的 python，并启动独立子进程。
+# 这样不会要求在 simlingo 环境中安装 diffusers / FLUX 依赖。
+# =============================================================================
+environments:
+  # Original SimLingo 使用的 Conda 环境名称。
+  simlingo_conda_env: "simlingo"
+
+  # LaMa + FLUX 使用的 Conda 环境名称。
+  cvaa_fill_conda_env: "cvaa_fill"
+
+  # 如果设置为 null，程序会根据 Conda 环境名称自动查找 python。
+  # 如果自动查找失败，也可以直接填写完整 python 路径，例如：
+  #   /home/kemove/anaconda3/envs/simlingo/bin/python
+  simlingo_python: null
+
+  # cvaa_fill 对应的 python。
+  # 一般保持 null，让程序根据 cvaa_fill_conda_env 自动查找即可。
+  cvaa_fill_python: null
+
+  # 启动正式批处理前是否先检查两个环境。
+  # true 时会提前确认：
+  #   simlingo：torch / transformers / accelerate 可导入
+  #   cvaa_fill：torch / diffusers / FluxFillPipeline 可导入
+  # 如果环境有问题，会在 actor matching 前直接报错，不再浪费时间。
+  validate_on_startup: true
+
+
 paths:
   # 最终结果保存根目录。
   # 默认只保留紧凑的最终结果以及可选 debug，中间 mask 和反事实图通常仅临时存在。
   output_root: "/home/kemove/ll/simlingo_liulei/database/simlingo_v2_2026_09_05_13_20_27/data/simlingo/cvaa_results"
 
   # 干净的原始官方 RenzKa/simlingo 源码目录。
+  # 最终 CVAA baseline 不应指向经过论文修改的 simlingo_liulei。
   official_simlingo_root: "/home/kemove/models/simlingo"
 
   # 原始官方 SimLingo 发布的 state dict。

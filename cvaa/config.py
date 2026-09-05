@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,6 +66,7 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     """检查配置文件中所有正式运行所需字段。"""
     for section in (
         "run",
+        "environments",
         "paths",
         "data",
         "matching",
@@ -99,6 +104,42 @@ def validate_config(cfg: Dict[str, Any]) -> None:
                 "run.recursive=false requires run.input to be a valid "
                 "CARLA route directory: %s" % input_path
             )
+
+    # ------------------------------------------------------------------
+    # 双 Python 环境
+    # ------------------------------------------------------------------
+    env_cfg = cfg["environments"]
+
+    for key in (
+        "simlingo_conda_env",
+        "cvaa_fill_conda_env",
+    ):
+        value = env_cfg.get(key)
+        if value is None or not str(value).strip():
+            raise ValueError(
+                "environments.%s may not be empty" % key
+            )
+
+    for key in (
+        "simlingo_python",
+        "cvaa_fill_python",
+    ):
+        value = env_cfg.get(key)
+        if value is not None:
+            python_path = _as_path(
+                value,
+                "environments.%s" % key,
+            )
+            if python_path is None or not python_path.is_file():
+                raise FileNotFoundError(
+                    "environments.%s does not exist: %s"
+                    % (key, python_path)
+                )
+            if not os.access(str(python_path), os.X_OK):
+                raise PermissionError(
+                    "environments.%s is not executable: %s"
+                    % (key, python_path)
+                )
 
     # ------------------------------------------------------------------
     # 模型与输出路径
@@ -385,6 +426,156 @@ def route_output_name(route_dir: Path) -> str:
     pipeline.py 会自动追加短路径哈希，避免结果目录冲突。
     """
     return route_dir.name
+
+
+
+def _conda_env_prefixes() -> Dict[str, Path]:
+    """
+    读取当前 Conda 可见的环境。
+
+    返回：
+        {
+            "simlingo": Path("/.../envs/simlingo"),
+            "cvaa_fill": Path("/.../envs/cvaa_fill"),
+            ...
+        }
+
+    优先使用 CONDA_EXE；如果当前 shell 没有该变量，再从 PATH 中查找 conda。
+    """
+    conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+    if not conda_exe:
+        raise RuntimeError(
+            "无法找到 conda。请先初始化 Conda shell，"
+            "或者在 config.yaml 中直接填写 environments.*_python。"
+        )
+
+    proc = subprocess.run(
+        [str(conda_exe), "env", "list", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "执行 'conda env list --json' 失败：%s"
+            % proc.stderr.strip()
+        )
+
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        raise RuntimeError(
+            "无法解析 Conda 环境列表：%r" % exc
+        )
+
+    result: Dict[str, Path] = {}
+    for raw_prefix in payload.get("envs", []):
+        prefix = Path(str(raw_prefix)).expanduser().resolve()
+        name = prefix.name
+        result[name] = prefix
+
+    # base 环境的 prefix 名称通常不是 "base"，额外根据 CONDA_PREFIX 补充。
+    current_env = os.environ.get("CONDA_DEFAULT_ENV")
+    current_prefix = os.environ.get("CONDA_PREFIX")
+    if current_env and current_prefix:
+        result[str(current_env)] = (
+            Path(current_prefix).expanduser().resolve()
+        )
+
+    return result
+
+
+def _python_from_conda_env(env_name: str) -> Path:
+    """根据 Conda 环境名称找到对应的 python 可执行文件。"""
+    env_name = str(env_name).strip()
+
+    # 当前进程本身就在目标环境时，直接使用 sys.executable，
+    # 避免不必要的 Conda 查询。
+    if os.environ.get("CONDA_DEFAULT_ENV") == env_name:
+        current = Path(sys.executable).expanduser().resolve()
+        if current.is_file():
+            return current
+
+    prefixes = _conda_env_prefixes()
+    if env_name not in prefixes:
+        raise RuntimeError(
+            "Conda 环境 %r 不存在。当前可见环境：%s"
+            % (
+                env_name,
+                ", ".join(sorted(prefixes.keys())),
+            )
+        )
+
+    prefix = prefixes[env_name]
+
+    # Linux / macOS
+    candidate = prefix / "bin" / "python"
+    if candidate.is_file():
+        return candidate.resolve()
+
+    # Windows 兼容
+    candidate = prefix / "python.exe"
+    if candidate.is_file():
+        return candidate.resolve()
+
+    raise FileNotFoundError(
+        "在 Conda 环境 %r 中找不到 python：%s"
+        % (env_name, prefix)
+    )
+
+
+def _resolve_worker_python(
+    explicit_python: Any,
+    conda_env_name: Any,
+    field_name: str,
+) -> Path:
+    """
+    worker Python 的解析顺序：
+
+    1. 如果 config.yaml 显式填写了 python 完整路径，直接使用；
+    2. 否则根据 Conda 环境名称自动解析。
+    """
+    if explicit_python is not None:
+        path = Path(str(explicit_python)).expanduser().resolve()
+    else:
+        path = _python_from_conda_env(str(conda_env_name))
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            "%s does not exist: %s" % (field_name, path)
+        )
+    if not os.access(str(path), os.X_OK):
+        raise PermissionError(
+            "%s is not executable: %s" % (field_name, path)
+        )
+    return path
+
+
+def resolved_environments(
+    cfg: Dict[str, Any],
+) -> Dict[str, Path]:
+    """
+    解析两个隔离 worker 的 Python。
+
+    最终运行架构：
+        parent process
+            ├── cvaa_fill python -> LaMa + FLUX
+            └── simlingo python  -> Original SimLingo
+    """
+    env_cfg = cfg["environments"]
+
+    return {
+        "simlingo_python": _resolve_worker_python(
+            env_cfg.get("simlingo_python"),
+            env_cfg.get("simlingo_conda_env"),
+            "environments.simlingo_python",
+        ),
+        "cvaa_fill_python": _resolve_worker_python(
+            env_cfg.get("cvaa_fill_python"),
+            env_cfg.get("cvaa_fill_conda_env"),
+            "environments.cvaa_fill_python",
+        ),
+    }
 
 
 def resolved_paths(

@@ -650,9 +650,10 @@ class InpaintingEngine(object):
             )
         except ImportError as e:
             raise RuntimeError(
-                "FluxFillPipeline is unavailable. "
-                "Install diffusers==0.32.2 on top of the official "
-                "SimLingo environment."
+                "FluxFillPipeline is unavailable in the cvaa_fill worker. "
+                "请检查 config.yaml 中 environments.cvaa_fill_*，并在 "
+                "cvaa_fill 环境中安装 diffusers==0.32.2。"
+                "不要把 FLUX/diffusers 依赖安装到 simlingo 环境。"
             ) from e
 
         dtype_map = {

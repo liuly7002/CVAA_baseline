@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import csv
-import gc
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import shutil
 import tempfile
 import time
@@ -14,34 +15,244 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import torch
 import yaml
 
-from .config import discover_routes, resolved_paths
-from .inpainting import (
-    InpaintingEngine,
-    SkipIntervention,
-    bbox_wh_xyxy,
-    mask_bbox_xyxy,
-)
+from .config import discover_routes, resolved_environments, resolved_paths
 from .matching import (
     decode_instance_png,
     exact_actor_mask_from_arrays,
     match_route_actors,
 )
 from .metrics import (
-    compute_metric_pair,
     rank_actor_scores,
     scene_stats,
 )
-from .simlingo import (
-    OfficialSimLingoRunner,
-    context_signature,
-    load_ground_truth_future_waypoints,
-    load_measurement,
-    prediction_to_xy,
-    save_paired_waypoint_debug,
-)
+
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+WORKER_DIR = PROJECT_ROOT / "cvaa" / "workers"
+
+
+def mask_bbox_xyxy(mask_u8: np.ndarray) -> List[int]:
+    """返回二值 mask 的 [x1, y1, x2, y2]。"""
+    ys, xs = np.nonzero(mask_u8 > 0)
+    if len(xs) == 0:
+        raise ValueError("Mask is empty.")
+    return [
+        int(xs.min()),
+        int(ys.min()),
+        int(xs.max()),
+        int(ys.max()),
+    ]
+
+
+def bbox_wh_xyxy(
+    bbox_xyxy: List[int],
+) -> Tuple[int, int]:
+    """根据 xyxy 外接框计算宽和高。"""
+    x1, y1, x2, y2 = [
+        int(v) for v in bbox_xyxy
+    ]
+    return (
+        int(x2 - x1 + 1),
+        int(y2 - y1 + 1),
+    )
+
+
+def _effective_config(
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """移除运行时内部字段，生成可以安全写入 worker JSON 的配置。"""
+    return {
+        key: value
+        for key, value in cfg.items()
+        if not str(key).startswith("_")
+    }
+
+
+def _write_json(
+    path: Path,
+    value: Dict[str, Any],
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            value,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def _read_worker_result(
+    path: Path,
+    worker_name: str,
+) -> Dict[str, Any]:
+    if not path.exists():
+        raise RuntimeError(
+            "%s worker 没有生成结果文件：%s"
+            % (worker_name, path)
+        )
+
+    payload = json.loads(
+        path.read_text(encoding="utf-8")
+    )
+
+    if payload.get("status") == "fatal":
+        raise RuntimeError(
+            "%s worker 失败：%s\n%s"
+            % (
+                worker_name,
+                payload.get("error"),
+                payload.get("traceback", ""),
+            )
+        )
+
+    return payload
+
+
+def _run_worker(
+    python_executable: Path,
+    worker_script: Path,
+    request_path: Path,
+    result_path: Path,
+    worker_name: str,
+) -> Dict[str, Any]:
+    """
+    使用指定 Conda 环境的 Python 启动独立 worker。
+
+    这里的 request/result 路径只是主程序与内部 worker 之间的临时 IPC，
+    不是用户需要手工填写的命令行参数。
+    """
+    env = os.environ.copy()
+
+    old_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(PROJECT_ROOT)
+        if not old_pythonpath
+        else str(PROJECT_ROOT)
+        + os.pathsep
+        + old_pythonpath
+    )
+
+    cmd = [
+        str(python_executable),
+        str(worker_script),
+        str(request_path),
+        str(result_path),
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+    )
+
+    if proc.returncode != 0:
+        # worker 即使失败也会尽量写 result.json，因此先读取详细错误。
+        if result_path.exists():
+            return _read_worker_result(
+                result_path,
+                worker_name,
+            )
+
+        raise RuntimeError(
+            "%s worker 异常退出，returncode=%d"
+            % (worker_name, proc.returncode)
+        )
+
+    return _read_worker_result(
+        result_path,
+        worker_name,
+    )
+
+
+def _preflight_environments(
+    cfg: Dict[str, Any],
+    envs: Dict[str, Path],
+) -> None:
+    """
+    在正式 actor matching 前检查双环境。
+
+    这样若 cvaa_fill 缺少 FluxFillPipeline，
+    会在批处理刚开始时直接报错，而不会等到第一个 chunk 才失败。
+    """
+    if not bool(
+        cfg["environments"].get(
+            "validate_on_startup",
+            True,
+        )
+    ):
+        return
+
+    print("[ENV] 检查 simlingo 环境：%s" % envs["simlingo_python"])
+    sim_code = (
+        "import sys, torch, transformers, accelerate; "
+        "print('[ENV OK] simlingo python=' + sys.executable); "
+        "print('[ENV OK] torch=' + str(torch.__version__) + "
+        "' transformers=' + str(transformers.__version__) + "
+        "' accelerate=' + str(accelerate.__version__))"
+    )
+    sim_proc = subprocess.run(
+        [
+            str(envs["simlingo_python"]),
+            "-c",
+            sim_code,
+        ],
+        cwd=str(PROJECT_ROOT),
+    )
+    if sim_proc.returncode != 0:
+        raise RuntimeError(
+            "simlingo 环境检查失败。请检查 environments.simlingo_* 配置。"
+        )
+
+    print("[ENV] 检查 cvaa_fill 环境：%s" % envs["cvaa_fill_python"])
+
+    backend = str(cfg["inpainting"]["backend"])
+    refine = str(
+        cfg["inpainting"]["flux_refine_mode"]
+    )
+
+    if (
+        backend == "flux_fill"
+        and refine != "none"
+    ):
+        fill_code = (
+            "import sys, torch, diffusers; "
+            "from diffusers import FluxFillPipeline; "
+            "print('[ENV OK] cvaa_fill python=' + sys.executable); "
+            "print('[ENV OK] torch=' + str(torch.__version__) + "
+            "' diffusers=' + str(diffusers.__version__)); "
+            "print('[ENV OK] FluxFillPipeline available')"
+        )
+    else:
+        fill_code = (
+            "import sys, torch, cv2, numpy, PIL; "
+            "print('[ENV OK] cvaa_fill python=' + sys.executable); "
+            "print('[ENV OK] basic inpainting dependencies available')"
+        )
+
+    fill_proc = subprocess.run(
+        [
+            str(envs["cvaa_fill_python"]),
+            "-c",
+            fill_code,
+        ],
+        cwd=str(PROJECT_ROOT),
+    )
+    if fill_proc.returncode != 0:
+        raise RuntimeError(
+            "cvaa_fill 环境检查失败。"
+            "请检查 environments.cvaa_fill_* 配置，"
+            "并确认 FluxFillPipeline 安装在 cvaa_fill，而不是 simlingo。"
+        )
 
 
 def _json_dump(
@@ -395,6 +606,7 @@ def process_route(
     route_output: Path,
     cfg: Dict[str, Any],
     paths: Dict[str, Optional[Path]],
+    envs: Dict[str, Path],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     route_start = time.time()
     route_id = route_output.name
@@ -587,6 +799,20 @@ def process_route(
             exist_ok=True,
         )
 
+    # ------------------------------------------------------------------
+    # 双环境 chunk 流程
+    #
+    # 主进程只负责：
+    #   1. 构造临时 exact mask；
+    #   2. 调用 cvaa_fill worker 生成当前 chunk 的反事实图；
+    #   3. cvaa_fill worker 退出后调用 simlingo worker；
+    #   4. 收集 AD / FD / debug 结果；
+    #   5. TemporaryDirectory 自动删除中间 mask / counterfactual image。
+    #
+    # 因为两个 worker 都是独立子进程，所以 worker 退出时 GPU 显存会由
+    # 操作系统/CUDA runtime 完整释放，不再依赖同一 Python 进程内的
+    # gc.collect() 或 torch.cuda.empty_cache()。
+    # ------------------------------------------------------------------
     for chunk_index, chunk in enumerate(
         chunks,
         1,
@@ -610,759 +836,437 @@ def process_route(
         ) as tmp:
             tmp_dir = Path(tmp)
 
-            # ==============================================================
-            # Phase A: counterfactual generation.
-            # The large inpainting models are loaded for this phase only.
-            # ==============================================================
-            inpaint_engine = None
+            # ==========================================================
+            # Phase A：在主进程中只准备轻量临时 mask。
+            # ==========================================================
+            inpaint_request_items: List[
+                Dict[str, Any]
+            ] = []
+
+            cached_instance_frame = None
+            cached_semantic = None
+            cached_instance16 = None
+
+            for item in chunk:
+                frame = str(item["frame"])
+                actor_id = str(item["actor_id"])
+
+                try:
+                    if cached_instance_frame != frame:
+                        (
+                            cached_semantic,
+                            cached_instance16,
+                        ) = decode_instance_png(
+                            Path(item["instance_path"])
+                        )
+                        cached_instance_frame = frame
+
+                    assert cached_semantic is not None
+                    assert cached_instance16 is not None
+
+                    exact_mask = exact_actor_mask_from_arrays(
+                        item,
+                        cached_semantic,
+                        cached_instance16,
+                    )
+
+                    # exact mask 仅作为当前 chunk 的临时 IPC 文件。
+                    # chunk 结束后会与临时反事实图一起自动删除。
+                    temp_mask_path = (
+                        tmp_dir
+                        / "exact_masks"
+                        / frame
+                        / ("actor_%s.png" % actor_id)
+                    )
+                    temp_mask_path.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    ok = cv2.imwrite(
+                        str(temp_mask_path),
+                        exact_mask,
+                    )
+                    if not ok:
+                        raise RuntimeError(
+                            "无法写入临时 exact mask：%s"
+                            % temp_mask_path
+                        )
+
+                    if bool(
+                        cfg["output"][
+                            "save_counterfactual_images"
+                        ]
+                    ):
+                        cf_path = (
+                            route_output
+                            / "counterfactual_images"
+                            / frame
+                            / ("actor_%s.png" % actor_id)
+                        )
+                    else:
+                        cf_path = (
+                            tmp_dir
+                            / "counterfactuals"
+                            / (
+                                "%s_actor_%s.png"
+                                % (frame, actor_id)
+                            )
+                        )
+
+                    exact_mask_path = None
+                    intervention_mask_path = None
+                    if bool(
+                        cfg["output"]["save_masks"]
+                    ):
+                        exact_mask_path = (
+                            route_output
+                            / "masks"
+                            / "exact"
+                            / frame
+                            / ("actor_%s.png" % actor_id)
+                        )
+                        intervention_mask_path = (
+                            route_output
+                            / "masks"
+                            / "intervention"
+                            / frame
+                            / ("actor_%s.png" % actor_id)
+                        )
+
+                    inpainting_debug_counter += 1
+                    diagnostic_path = None
+                    if (
+                        bool(cfg["debug"]["enabled"])
+                        and bool(
+                            cfg["debug"][
+                                "save_inpainting_diagnostic"
+                            ]
+                        )
+                        and (
+                            inpainting_debug_counter
+                            % int(
+                                cfg["debug"][
+                                    "every_n_actors"
+                                ]
+                            )
+                            == 0
+                        )
+                    ):
+                        diagnostic_path = (
+                            route_output
+                            / "debug"
+                            / "inpainting"
+                            / (
+                                "%s_actor_%s.jpg"
+                                % (frame, actor_id)
+                            )
+                        )
+
+                    inpaint_request_items.append(
+                        {
+                            **item,
+                            "exact_mask_path":
+                                str(temp_mask_path),
+                            "counterfactual_image":
+                                str(cf_path),
+                            "diagnostic_path": (
+                                str(diagnostic_path)
+                                if diagnostic_path
+                                is not None
+                                else None
+                            ),
+                            "save_exact_mask_path": (
+                                str(exact_mask_path)
+                                if exact_mask_path
+                                is not None
+                                else None
+                            ),
+                            "save_intervention_mask_path": (
+                                str(
+                                    intervention_mask_path
+                                )
+                                if intervention_mask_path
+                                is not None
+                                else None
+                            ),
+                        }
+                    )
+
+                except Exception as exc:
+                    inpainting_failures += 1
+                    _append_jsonl(
+                        failures_path,
+                        {
+                            "stage":
+                                "prepare_inpainting_worker",
+                            "frame": frame,
+                            "actor_id": actor_id,
+                            "error": repr(exc),
+                        },
+                    )
+
+            if not inpaint_request_items:
+                continue
+
+            # ==========================================================
+            # Phase B：cvaa_fill 环境生成反事实图。
+            # ==========================================================
+            inpaint_request_path = (
+                tmp_dir / "inpaint_request.json"
+            )
+            inpaint_result_path = (
+                tmp_dir / "inpaint_result.json"
+            )
+
+            _write_json(
+                inpaint_request_path,
+                {
+                    "config":
+                        _effective_config(cfg),
+                    "lama_model_path":
+                        str(paths["lama_model"]),
+                    "flux_model":
+                        str(
+                            cfg["paths"]["flux_model"]
+                        ),
+                    "items":
+                        inpaint_request_items,
+                },
+            )
+
+            inpaint_payload = _run_worker(
+                python_executable=envs[
+                    "cvaa_fill_python"
+                ],
+                worker_script=(
+                    WORKER_DIR
+                    / "inpaint_worker.py"
+                ),
+                request_path=inpaint_request_path,
+                result_path=inpaint_result_path,
+                worker_name="cvaa_fill",
+            )
+
             generated_items: List[
                 Dict[str, Any]
             ] = []
 
-            try:
-                inpaint_engine = (
-                    InpaintingEngine(
-                        cfg=cfg,
-                        lama_model_path=paths[
-                            "lama_model"
-                        ],
-                        flux_model=str(
-                            cfg["paths"][
-                                "flux_model"
-                            ]
-                        ),
+            # 用 frame+actor 重新索引 request，
+            # 把 worker 返回的 meta 与原始 actor 信息合并。
+            request_index = {
+                (
+                    str(x["frame"]),
+                    str(x["actor_id"]),
+                ): x
+                for x in inpaint_request_items
+            }
+
+            for result in inpaint_payload.get(
+                "results",
+                [],
+            ):
+                frame = str(result["frame"])
+                actor_id = str(result["actor_id"])
+                key = (frame, actor_id)
+                original_item = request_index[key]
+
+                if result["status"] == "ok":
+                    meta = result.get("meta") or {}
+                    generated_counterfactuals += 1
+                    generated_items.append(
+                        {
+                            **original_item,
+                            **meta,
+                            "counterfactual_image":
+                                original_item[
+                                    "counterfactual_image"
+                                ],
+                        }
                     )
-                )
 
-                cached_instance_frame = None
-                cached_semantic = None
-                cached_instance16 = None
+                elif result["status"] == "skip":
+                    skipped_count += 1
+                    _append_jsonl(
+                        skipped_path,
+                        {
+                            "frame": frame,
+                            "actor_id": actor_id,
+                            "reason": result.get(
+                                "reason"
+                            ),
+                        },
+                    )
 
-                for item in chunk:
-                    frame = str(item["frame"])
-                    actor_id = str(item["actor_id"])
-
-                    try:
-                        if cached_instance_frame != frame:
-                            (
-                                cached_semantic,
-                                cached_instance16,
-                            ) = decode_instance_png(
-                                Path(item["instance_path"])
-                            )
-                            cached_instance_frame = frame
-
-                        assert cached_semantic is not None
-                        assert cached_instance16 is not None
-
-                        exact_mask = exact_actor_mask_from_arrays(
-                            item,
-                            cached_semantic,
-                            cached_instance16,
+                else:
+                    inpainting_failures += 1
+                    _append_jsonl(
+                        failures_path,
+                        {
+                            "stage": "inpainting",
+                            "frame": frame,
+                            "actor_id": actor_id,
+                            "error": result.get(
+                                "error"
+                            ),
+                            "traceback": result.get(
+                                "traceback"
+                            ),
+                        },
+                    )
+                    print(
+                        "[INPAINT ERROR] frame=%s actor=%s: %s"
+                        % (
+                            frame,
+                            actor_id,
+                            result.get("error"),
                         )
-
-                        if bool(
-                            cfg["output"][
-                                "save_counterfactual_images"
-                            ]
-                        ):
-                            cf_path = (
-                                route_output
-                                / "counterfactual_images"
-                                / frame
-                                / (
-                                    "actor_%s.png"
-                                    % actor_id
-                                )
-                            )
-                        else:
-                            cf_path = (
-                                tmp_dir
-                                / (
-                                    "%s_actor_%s.png"
-                                    % (
-                                        frame,
-                                        actor_id,
-                                    )
-                                )
-                            )
-
-                        exact_mask_path = None
-                        intervention_mask_path = None
-                        if bool(
-                            cfg["output"][
-                                "save_masks"
-                            ]
-                        ):
-                            exact_mask_path = (
-                                route_output
-                                / "masks"
-                                / "exact"
-                                / frame
-                                / (
-                                    "actor_%s.png"
-                                    % actor_id
-                                )
-                            )
-                            intervention_mask_path = (
-                                route_output
-                                / "masks"
-                                / "intervention"
-                                / frame
-                                / (
-                                    "actor_%s.png"
-                                    % actor_id
-                                )
-                            )
-
-                        inpainting_debug_counter += 1
-                        diagnostic_path = None
-                        if (
-                            bool(
-                                cfg["debug"][
-                                    "enabled"
-                                ]
-                            )
-                            and bool(
-                                cfg["debug"][
-                                    "save_inpainting_diagnostic"
-                                ]
-                            )
-                            and (
-                                inpainting_debug_counter
-                                % int(
-                                    cfg["debug"][
-                                        "every_n_actors"
-                                    ]
-                                )
-                                == 0
-                            )
-                        ):
-                            diagnostic_path = (
-                                route_output
-                                / "debug"
-                                / "inpainting"
-                                / (
-                                    "%s_actor_%s.jpg"
-                                    % (
-                                        frame,
-                                        actor_id,
-                                    )
-                                )
-                            )
-
-                        meta = (
-                            inpaint_engine.generate(
-                                source_path=Path(
-                                    item[
-                                        "source_image"
-                                    ]
-                                ),
-                                actor_class=str(
-                                    item[
-                                        "actor_class"
-                                    ]
-                                ),
-                                exact_mask_u8=(
-                                    exact_mask
-                                ),
-                                output_path=cf_path,
-                                diagnostic_path=(
-                                    diagnostic_path
-                                ),
-                                save_exact_mask_path=(
-                                    exact_mask_path
-                                ),
-                                save_intervention_mask_path=(
-                                    intervention_mask_path
-                                ),
-                            )
-                        )
-
-                        generated_counterfactuals += 1
-                        generated_items.append(
-                            {
-                                **item,
-                                **meta,
-                                "counterfactual_image":
-                                    str(cf_path),
-                            }
-                        )
-
-                    except SkipIntervention as exc:
-                        skipped_count += 1
-                        _append_jsonl(
-                            skipped_path,
-                            {
-                                "frame": frame,
-                                "actor_id":
-                                    actor_id,
-                                "reason":
-                                    str(exc),
-                            },
-                        )
-
-                    except Exception as exc:
-                        inpainting_failures += 1
-                        _append_jsonl(
-                            failures_path,
-                            {
-                                "stage":
-                                    "inpainting",
-                                "frame": frame,
-                                "actor_id":
-                                    actor_id,
-                                "error":
-                                    repr(exc),
-                            },
-                        )
-                        print(
-                            "[INPAINT ERROR] frame=%s actor=%s: %s"
-                            % (
-                                frame,
-                                actor_id,
-                                exc,
-                            )
-                        )
-            finally:
-                if inpaint_engine is not None:
-                    inpaint_engine.close()
-                    del inpaint_engine
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    )
 
             if not generated_items:
                 continue
 
-            # ==============================================================
-            # Phase B: original SimLingo paired inference + AD/FD.
-            # FLUX/LaMa have already been released, so GPU memory is reused.
-            # ==============================================================
-            sim_runner = None
-            try:
-                sim_runner = (
-                    OfficialSimLingoRunner(
-                        cfg=cfg,
-                        official_root=paths[
-                            "official_simlingo_root"
-                        ],
-                        checkpoint=paths[
-                            "official_simlingo_checkpoint"
-                        ],
-                        explicit_config=paths[
+            # ==========================================================
+            # Phase C：cvaa_fill 子进程已经退出。
+            # 此时再启动 simlingo 环境进行 Original SimLingo 推理。
+            # ==========================================================
+            sim_request_path = (
+                tmp_dir / "simlingo_request.json"
+            )
+            sim_result_path = (
+                tmp_dir / "simlingo_result.json"
+            )
+
+            _write_json(
+                sim_request_path,
+                {
+                    "config":
+                        _effective_config(cfg),
+                    "route_dir":
+                        str(route_dir),
+                    "route_output":
+                        str(route_output),
+                    "route_id":
+                        route_id,
+                    "official_simlingo_root":
+                        str(
+                            paths[
+                                "official_simlingo_root"
+                            ]
+                        ),
+                    "official_simlingo_checkpoint":
+                        str(
+                            paths[
+                                "official_simlingo_checkpoint"
+                            ]
+                        ),
+                    "official_simlingo_config": (
+                        str(
+                            paths[
+                                "official_simlingo_config"
+                            ]
+                        )
+                        if paths[
                             "official_simlingo_config"
-                        ],
-                    )
-                )
-                if simlingo_source_info is None:
-                    simlingo_source_info = (
-                        sim_runner.source_info
-                    )
-                    simlingo_config_path = str(
-                        sim_runner.config_path
-                    )
-
-                items_by_frame = (
-                    _group_by_frame(
-                        generated_items
-                    )
-                )
-
-                for frame_items in items_by_frame:
-                    frame = str(
-                        frame_items[0][
-                            "frame"
                         ]
+                        is not None
+                        else None
+                    ),
+                    "evaluated_counter_start":
+                        evaluated_counter,
+                    "items":
+                        generated_items,
+                },
+            )
+
+            sim_payload = _run_worker(
+                python_executable=envs[
+                    "simlingo_python"
+                ],
+                worker_script=(
+                    WORKER_DIR
+                    / "simlingo_worker.py"
+                ),
+                request_path=sim_request_path,
+                result_path=sim_result_path,
+                worker_name="simlingo",
+            )
+
+            if simlingo_source_info is None:
+                simlingo_source_info = (
+                    sim_payload.get("source_info")
+                )
+                simlingo_config_path = (
+                    sim_payload.get("config_path")
+                )
+
+            evaluated_counter = int(
+                sim_payload.get(
+                    "evaluated_counter_end",
+                    evaluated_counter,
+                )
+            )
+
+            new_scores = sim_payload.get(
+                "scores",
+                [],
+            )
+            actor_scores.extend(new_scores)
+
+            for failure in sim_payload.get(
+                "failures",
+                [],
+            ):
+                inference_failures += 1
+                _append_jsonl(
+                    failures_path,
+                    failure,
+                )
+                print(
+                    "[SIMLINGO ERROR] frame=%s actor=%s: %s"
+                    % (
+                        failure.get("frame"),
+                        failure.get("actor_id"),
+                        failure.get("error"),
+                    )
+                )
+
+            progress_every = int(
+                cfg["runtime"][
+                    "progress_every"
+                ]
+            )
+            if progress_every > 0:
+                for score in new_scores:
+                    # worker 已经完成指标计算，这里只负责统一打印结果。
+                    if (
+                        int(
+                            score.get(
+                                "_progress_index",
+                                0,
+                            )
+                            or 0
+                        )
+                        % progress_every
+                        == 0
+                    ):
+                        pass
+
+                # 为保持原开发版终端风格，直接打印本 chunk 的成功结果。
+                for score in new_scores:
+                    print(
+                        "[OK] route=%s frame=%s actor=%s AD=%.6f FD=%.6f"
+                        % (
+                            route_id,
+                            score["frame"],
+                            score["actor_id"],
+                            score["AD"],
+                            score["FD"],
+                        )
                     )
 
-                    try:
-                        measurement, measurement_path = (
-                            load_measurement(
-                                route_dir,
-                                frame,
-                            )
-                        )
-
-                        (
-                            original_prediction,
-                            original_context,
-                        ) = sim_runner.infer(
-                            image_path=Path(
-                                frame_items[0][
-                                    "source_image"
-                                ]
-                            ),
-                            measurement=measurement,
-                        )
-
-                    except Exception as exc:
-                        inference_failures += len(
-                            frame_items
-                        )
-                        for item in frame_items:
-                            _append_jsonl(
-                                failures_path,
-                                {
-                                    "stage":
-                                        "original_inference",
-                                    "frame":
-                                        frame,
-                                    "actor_id":
-                                        item[
-                                            "actor_id"
-                                        ],
-                                    "error":
-                                        repr(exc),
-                                },
-                            )
-                        print(
-                            "[SIMLINGO ERROR] frame=%s original: %s"
-                            % (
-                                frame,
-                                exc,
-                            )
-                        )
-                        continue
-
-                    gt_waypoints = None
-                    if (
-                        bool(
-                            cfg["debug"][
-                                "enabled"
-                            ]
-                        )
-                        and bool(
-                            cfg["debug"][
-                                "save_waypoint_comparison"
-                            ]
-                        )
-                    ):
-                        try:
-                            original_pred_xy = (
-                                prediction_to_xy(
-                                    original_prediction.get(
-                                        "pred_speed_wps"
-                                    ),
-                                    "original.pred_speed_wps",
-                                )
-                            )
-                            gt_waypoints = (
-                                load_ground_truth_future_waypoints(
-                                    route_dir=route_dir,
-                                    frame=frame,
-                                    num_waypoints=int(
-                                        original_pred_xy.shape[
-                                            0
-                                        ]
-                                    ),
-                                )
-                            )
-                        except Exception as exc:
-                            print(
-                                "[DEBUG WARNING] frame=%s GT: %s"
-                                % (
-                                    frame,
-                                    exc,
-                                )
-                            )
-                            gt_waypoints = None
-
-                    for item in frame_items:
-                        actor_id = str(
-                            item[
-                                "actor_id"
-                            ]
-                        )
-                        try:
-                            (
-                                cf_prediction,
-                                cf_context,
-                            ) = sim_runner.infer(
-                                image_path=Path(
-                                    item[
-                                        "counterfactual_image"
-                                    ]
-                                ),
-                                measurement=measurement,
-                            )
-
-                            if (
-                                context_signature(
-                                    original_context
-                                )
-                                != context_signature(
-                                    cf_context
-                                )
-                            ):
-                                raise RuntimeError(
-                                    "Non-visual paired-input invariant failed."
-                                )
-
-                            route_metric = (
-                                compute_metric_pair(
-                                    original_prediction.get(
-                                        "pred_route"
-                                    ),
-                                    cf_prediction.get(
-                                        "pred_route"
-                                    ),
-                                    "pred_route",
-                                )
-                            )
-
-                            speed_diag = None
-                            if bool(
-                                cfg["output"][
-                                    "include_speed_wps_diagnostic"
-                                ]
-                            ):
-                                speed_diag = (
-                                    compute_metric_pair(
-                                        original_prediction.get(
-                                            "pred_speed_wps"
-                                        ),
-                                        cf_prediction.get(
-                                            "pred_speed_wps"
-                                        ),
-                                        "pred_speed_wps",
-                                    )
-                                )
-
-                            evaluated_counter += 1
-                            waypoint_debug_path = None
-
-                            if (
-                                gt_waypoints
-                                is not None
-                                and bool(
-                                    cfg["debug"][
-                                        "enabled"
-                                    ]
-                                )
-                                and bool(
-                                    cfg["debug"][
-                                        "save_waypoint_comparison"
-                                    ]
-                                )
-                                and (
-                                    evaluated_counter
-                                    % int(
-                                        cfg["debug"][
-                                            "every_n_actors"
-                                        ]
-                                    )
-                                    == 0
-                                )
-                            ):
-                                waypoint_debug_path = (
-                                    route_output
-                                    / "debug"
-                                    / "waypoints"
-                                    / (
-                                        "%s_actor_%s.jpg"
-                                        % (
-                                            frame,
-                                            actor_id,
-                                        )
-                                    )
-                                )
-                                save_paired_waypoint_debug(
-                                    output_path=(
-                                        waypoint_debug_path
-                                    ),
-                                    source_image=Path(
-                                        item[
-                                            "source_image"
-                                        ]
-                                    ),
-                                    counterfactual_image=Path(
-                                        item[
-                                            "counterfactual_image"
-                                        ]
-                                    ),
-                                    original_prediction=(
-                                        original_prediction
-                                    ),
-                                    counterfactual_prediction=(
-                                        cf_prediction
-                                    ),
-                                    gt_waypoints=(
-                                        gt_waypoints
-                                    ),
-                                    frame=frame,
-                                    actor_id=actor_id,
-                                )
-
-                            final_cf_path = None
-                            if bool(
-                                cfg["output"][
-                                    "save_counterfactual_images"
-                                ]
-                            ):
-                                final_cf_path = str(
-                                    item[
-                                        "counterfactual_image"
-                                    ]
-                                )
-
-                            score: Dict[
-                                str,
-                                Any,
-                            ] = {
-                                "route_id":
-                                    route_id,
-                                "route_dir":
-                                    str(
-                                        route_dir
-                                    ),
-                                "frame":
-                                    frame,
-                                "actor_id":
-                                    actor_id,
-                                "actor_class":
-                                    item[
-                                        "actor_class"
-                                    ],
-                                "distance_m":
-                                    item.get(
-                                        "distance_m"
-                                    ),
-                                "instance16":
-                                    item.get(
-                                        "instance16"
-                                    ),
-                                "match_score":
-                                    item.get(
-                                        "match_score"
-                                    ),
-                                "AD":
-                                    route_metric[
-                                        "AD"
-                                    ],
-                                "FD":
-                                    route_metric[
-                                        "FD"
-                                    ],
-                                "rank":
-                                    None,
-                                "ranking_trajectory":
-                                    "pred_route",
-                                "T":
-                                    route_metric[
-                                        "T"
-                                    ],
-                                "K_original":
-                                    route_metric[
-                                        "K_original"
-                                    ],
-                                "K_counterfactual":
-                                    route_metric[
-                                        "K_counterfactual"
-                                    ],
-                                "exact_mask_pixels":
-                                    item.get(
-                                        "exact_mask_pixels"
-                                    ),
-                                "mask_pixels_used":
-                                    item.get(
-                                        "mask_pixels_used"
-                                    ),
-                                "exact_bbox_xyxy":
-                                    item.get(
-                                        "exact_bbox_xyxy"
-                                    ),
-                                "adaptive_dilation_radius_px":
-                                    item.get(
-                                        "adaptive_dilation_radius_px"
-                                    ),
-                                "backend":
-                                    item.get(
-                                        "backend"
-                                    ),
-                                "pipeline_strategy":
-                                    item.get(
-                                        "pipeline_strategy"
-                                    ),
-                                "flux_refine_mode":
-                                    item.get(
-                                        "flux_refine_mode"
-                                    ),
-                                "outside_mask_changed_pixels":
-                                    item.get(
-                                        "outside_mask_changed_pixels"
-                                    ),
-                                "measurement_path":
-                                    str(
-                                        measurement_path
-                                    ),
-                                "source_image":
-                                    item.get(
-                                        "source_image"
-                                    ),
-                                "counterfactual_image":
-                                    final_cf_path,
-                                "waypoint_debug_image":
-                                    (
-                                        str(
-                                            waypoint_debug_path
-                                        )
-                                        if waypoint_debug_path
-                                        is not None
-                                        else None
-                                    ),
-                                "nonvisual_inputs_identical":
-                                    True,
-                            }
-
-                            if speed_diag is not None:
-                                score[
-                                    "speed_wps_diagnostic"
-                                ] = {
-                                    "AD":
-                                        speed_diag[
-                                            "AD"
-                                        ],
-                                    "FD":
-                                        speed_diag[
-                                            "FD"
-                                        ],
-                                    "T":
-                                        speed_diag[
-                                            "T"
-                                        ],
-                                }
-
-                            if bool(
-                                cfg["simlingo"][
-                                    "save_language"
-                                ]
-                            ):
-                                score[
-                                    "original_language"
-                                ] = (
-                                    original_prediction.get(
-                                        "language"
-                                    )
-                                )
-                                score[
-                                    "counterfactual_language"
-                                ] = (
-                                    cf_prediction.get(
-                                        "language"
-                                    )
-                                )
-
-                            if bool(
-                                cfg["output"][
-                                    "save_trajectories"
-                                ]
-                            ):
-                                score[
-                                    "original_pred_route"
-                                ] = (
-                                    route_metric[
-                                        "original_mean_trajectory"
-                                    ]
-                                )
-                                score[
-                                    "counterfactual_pred_route"
-                                ] = (
-                                    route_metric[
-                                        "counterfactual_mean_trajectory"
-                                    ]
-                                )
-                                score[
-                                    "route_displacement_per_timestep"
-                                ] = (
-                                    route_metric[
-                                        "per_timestep_displacement"
-                                    ]
-                                )
-                                if speed_diag is not None:
-                                    score[
-                                        "speed_wps_diagnostic"
-                                    ][
-                                        "original_mean_trajectory"
-                                    ] = (
-                                        speed_diag[
-                                            "original_mean_trajectory"
-                                        ]
-                                    )
-                                    score[
-                                        "speed_wps_diagnostic"
-                                    ][
-                                        "counterfactual_mean_trajectory"
-                                    ] = (
-                                        speed_diag[
-                                            "counterfactual_mean_trajectory"
-                                        ]
-                                    )
-
-                            actor_scores.append(
-                                score
-                            )
-
-                            progress_every = int(
-                                cfg["runtime"][
-                                    "progress_every"
-                                ]
-                            )
-                            if (
-                                progress_every > 0
-                                and evaluated_counter
-                                % progress_every
-                                == 0
-                            ):
-                                print(
-                                    "[OK] route=%s frame=%s actor=%s AD=%.6f FD=%.6f"
-                                    % (
-                                        route_id,
-                                        frame,
-                                        actor_id,
-                                        score[
-                                            "AD"
-                                        ],
-                                        score[
-                                            "FD"
-                                        ],
-                                    )
-                                )
-
-                        except Exception as exc:
-                            inference_failures += 1
-                            _append_jsonl(
-                                failures_path,
-                                {
-                                    "stage":
-                                        "counterfactual_inference_or_metric",
-                                    "frame":
-                                        frame,
-                                    "actor_id":
-                                        actor_id,
-                                    "error":
-                                        repr(exc),
-                                },
-                            )
-                            print(
-                                "[SIMLINGO ERROR] frame=%s actor=%s: %s"
-                                % (
-                                    frame,
-                                    actor_id,
-                                    exc,
-                                )
-                            )
-
-            finally:
-                if sim_runner is not None:
-                    sim_runner.close()
-                    del sim_runner
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            # TemporaryDirectory deletes all non-persistent counterfactual PNGs
-            # immediately when this chunk exits.
+            # 退出 with TemporaryDirectory 后：
+            # 当前 chunk 的临时 exact mask、反事实图和 worker IPC JSON
+            # 会一起自动删除，不会长期占用本地磁盘。
 
     frame_rankings = rank_actor_scores(
         actor_scores
@@ -1503,6 +1407,12 @@ def run_pipeline(
 ) -> Dict[str, Any]:
     start = time.time()
     paths = resolved_paths(cfg)
+    envs = resolved_environments(cfg)
+    _preflight_environments(
+        cfg,
+        envs,
+    )
+
     output_root = paths[
         "output_root"
     ]
@@ -1541,6 +1451,14 @@ def run_pipeline(
     print("=" * 80)
     print("routes: %d" % len(routes))
     print("output: %s" % output_root)
+    print(
+        "simlingo python: %s"
+        % envs["simlingo_python"]
+    )
+    print(
+        "cvaa_fill python: %s"
+        % envs["cvaa_fill_python"]
+    )
     print(
         "persistent counterfactual images: %s"
         % bool(
@@ -1595,6 +1513,7 @@ def run_pipeline(
                     route_output=route_output,
                     cfg=cfg,
                     paths=paths,
+                    envs=envs,
                 )
             )
             route_summaries.append(
@@ -1701,6 +1620,15 @@ def run_pipeline(
         "ranking_rule": {
             "primary": "pred_route AD descending",
             "tie_break": "FD descending",
+        },
+        "worker_environments": {
+            "simlingo_python": str(
+                envs["simlingo_python"]
+            ),
+            "cvaa_fill_python": str(
+                envs["cvaa_fill_python"]
+            ),
+            "isolated_processes": True,
         },
         "storage_policy": {
             "streamed_unified_pipeline": True,

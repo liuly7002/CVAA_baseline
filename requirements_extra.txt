@@ -1,4 +1,17 @@
-# Install these additions on TOP OF the official RenzKa/simlingo environment.
-# Official environment already pins torch==2.2.0, transformers==4.46.3,
-# accelerate==1.0.1, scipy, opencv, pillow, hydra-core, etc.
-diffusers==0.32.2
+# =============================================================================
+# simlingo / 主流程额外依赖
+#
+# 最终双环境版本不会在 simlingo 环境中安装 diffusers / FLUX。
+# 官方 RenzKa/simlingo 的 environment.yaml 已经包含主流程需要的：
+#   torch
+#   transformers
+#   accelerate
+#   numpy
+#   scipy
+#   opencv
+#   pillow
+#   hydra
+#   pyyaml
+#
+# 因此该文件当前不额外安装 Python 包。
+# =============================================================================
