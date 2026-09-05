@@ -1,214 +1,257 @@
 # =============================================================================
-# CVAA baseline final batch configuration
-# Edit this file only. The runtime command is simply:
+# CVAA baseline 最终批量处理配置
+#
+# 正式运行时只需要修改本文件，然后执行：
 #     python run_pipeline.py
+#
+# 数据输入支持两种模式：
+#   run.recursive = true
+#       run.input 可以指向包含多层子目录的数据根目录，程序会递归寻找所有合法路线。
+#
+#   run.recursive = false
+#       run.input 必须直接指向一条合法的 CARLA route 目录。
 # =============================================================================
 
+run:
+  # 输入路径。
+  # recursive=true 时：可以填写 data/simlingo 等高层父目录。
+  # recursive=false 时：必须直接填写某一条 route 目录。
+  input: "/home/kemove/ll/simlingo_liulei/database/simlingo_v2_2026_09_05_13_20_27/data/simlingo"
+
+  # 是否递归查找路线。
+  # true：递归遍历 input 下的所有子目录，并依据目录内容判断合法 route。
+  # false：不向下查找，直接把 input 当作一条 route。
+  recursive: true
+
+
 paths:
-  # Root containing one or more CARLA route directories.
-  # A valid route must contain: instance_front/, boxes/, measurements/,
-  # surround_camera_config.json and rgb/ or rgb_front/.
-  routes_root: "/path/to/routes_root"
+  # 最终结果保存根目录。
+  # 默认只保留紧凑的最终结果以及可选 debug，中间 mask 和反事实图通常仅临时存在。
+  output_root: "/home/kemove/ll/simlingo_liulei/database/simlingo_v2_2026_09_05_13_20_27/data/simlingo/cvaa_results"
 
-  # Recursive glob under routes_root used to discover route directories.
-  route_glob: "**/Town*"
+  # 干净的原始官方 RenzKa/simlingo 源码目录。
+  official_simlingo_root: "/home/kemove/models/simlingo"
 
-  # Optional explicit route directories. If non-empty, these are used instead of
-  # routes_root + route_glob.
-  explicit_routes: []
+  # 原始官方 SimLingo 发布的 state dict。
+  official_simlingo_checkpoint: "/home/kemove/models/simlingo/checkpoint/simlingo/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt"
 
-  # Final result root. Only compact final outputs and optional debug images are
-  # retained here. Large intermediate masks/counterfactual images are temporary.
-  output_root: "/path/to/cvaa_results"
-
-  # Clean checkout of the ORIGINAL RenzKa/simlingo repository.
-  official_simlingo_root: "/path/to/RenzKa/simlingo"
-
-  # Official SimLingo released state dict.
-  official_simlingo_checkpoint: "/path/to/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt"
-
-  # Official SimLingo training Hydra config. Set null to infer it from checkpoint.
+  # 原始官方 SimLingo 训练时保存的 Hydra 配置。
+  # 设置为 null 时，程序会尝试根据 checkpoint 目录结构自动推断。
   official_simlingo_config: null
 
-  # Local FLUX.1-Fill-dev directory or Hugging Face model id.
-  flux_model: "/path/to/FLUX.1-Fill-dev"
+  # 本地 FLUX.1-Fill-dev 模型目录，或者 Hugging Face 模型 ID。
+  flux_model: "/home/kemove/models/FLUX.1-Fill-dev"
 
-  # Local TorchScript LaMa model (big-lama.pt).
-  lama_model: "/path/to/big-lama.pt"
+  # 本地 LaMa TorchScript 模型权重 big-lama.pt。
+  lama_model: "/home/kemove/models/LAMA/big-lama.pt"
 
-  # Temporary cache root. Temporary counterfactual PNGs are deleted after each
-  # processing chunk. Set null to use the system temporary directory.
+  # 临时缓存根目录。
+  # 当前 chunk 的反事实图会临时保存在这里，并在该 chunk 完成后自动删除。
+  # 设置为 null 时使用系统临时目录。
   temp_root: null
 
 
 data:
-  # Maximum number of discovered routes to process. 0 = all.
+  # 最多处理多少条递归发现的路线。
+  # 0 表示处理全部路线。
   max_routes: 0
 
-  # Frame selection. null start/end means full route.
+  # 帧范围。
+  # null 表示不限制起始/结束帧。
   frame_start: null
   frame_end: null
+
+  # 帧采样步长。
+  # 1 表示逐帧处理，2 表示每隔一帧处理一次。
   frame_step: 1
 
-  # Maximum selected frames per route. 0 = all.
+  # 每条 route 最多选择多少帧。
+  # 0 表示不限制。
   max_frames_per_route: 0
 
-  # Candidate actor classes included in the CVAA intervention.
+  # 是否把静态障碍物类别也纳入 CVAA 候选对象。
+  # false 时主要处理 vehicle / pedestrian 等动态交通参与者。
   include_static_obstacles: false
 
 
 matching:
-  # Minimum projected 2D box area before an actor is considered.
+  # actor 的 3D bbox 投影到图像后，最小允许的二维框面积。
   min_projected_area: 20
 
-  # Minimum compatible instance pixels overlapping the projected actor box.
+  # actor 投影框内至少需要多少个兼容 instance 像素。
   min_overlap_pixels: 5
 
-  # Minimum actor-instance matching score.
+  # actor-instance 匹配的最低总分。
   min_score: 0.20
 
-  # Bonus when the same actor keeps the same image-side instance id over time.
+  # 若同一 actor 在相邻帧继续对应同一个图像 instance id，增加该时间连续性奖励。
   temporal_bonus: 0.20
 
-  # Maximum selected-frame gap for applying temporal consistency bonus.
+  # 允许应用时间连续性奖励的最大已选择帧间隔。
   temporal_max_gap: 5
 
 
 mask:
-  # Minimum exact visible instance pixels before an intervention is allowed.
+  # exact instance mask 至少需要多少个可见像素才允许执行干预。
   min_mask_pixels: 10
 
-  # Skip tiny objects whose exact visible bbox short side is below this value.
+  # exact mask 外接框短边低于该值时认为目标太小，跳过。
   min_object_short_side_px: 12
 
-  # Additional stricter exact-mask size filter used by the final inpainting stage.
+  # 正式 inpainting 前进一步使用的更严格 exact-mask 像素阈值。
   min_exact_mask_pixels: 80
 
-  # Adaptive dilation: radius = ratio * max(object bbox width, height), clipped
-  # to [adaptive_dilate_min_px, adaptive_dilate_max_px].
+  # 自适应扩张半径：
+  # radius = adaptive_dilate_ratio * max(bbox_width, bbox_height)，
+  # 最后限制在 [adaptive_dilate_min_px, adaptive_dilate_max_px]。
   adaptive_dilate_ratio: 0.35
   adaptive_dilate_min_px: 8
   adaptive_dilate_max_px: 32
 
 
 inpainting:
-  # Final paper backend. "flux_fill" = LaMa removal + FLUX seam refinement.
-  # "lama_only" is useful for ablation; "opencv" is debug-only.
+  # 正式论文实验推荐使用 "flux_fill"：
+  # LaMa 负责真正删除目标，FLUX 负责边界视觉修复。
+  #
+  # 可选：
+  #   flux_fill：LaMa + FLUX
+  #   lama_only：只使用 LaMa，可用于消融
+  #   opencv：仅用于快速调试
   backend: "flux_fill"
 
-  # LaMa runs on CPU by default to reduce GPU memory pressure.
+  # LaMa 默认放在 CPU，减少与 SimLingo / FLUX 的 GPU 显存竞争。
   lama_device: "cpu"
 
-  # FLUX execution device.
+  # FLUX 推理设备。
   device: "cuda"
   dtype: "bfloat16"
 
-  # FLUX generation settings.
+  # FLUX 生成参数。
   num_inference_steps: 28
   guidance_scale: 30.0
   max_sequence_length: 512
   seed: 42
 
-  # Optional global prompt override. null = use class-specific removal prompts.
+  # 可选的全局 prompt。
+  # null 表示根据 actor 类别自动使用对应删除提示词。
   prompt_override: null
 
-  # Local crop magnifies small actors before inpainting.
+  # 是否只截取目标附近的局部区域执行高成本 inpainting。
+  # 对远处小目标尤其重要。
   local_crop_enabled: true
+
+  # 局部 crop 的上下文范围和尺寸控制。
   crop_context_scale: 8.0
   crop_min_side_px: 192
   crop_max_side_px: 512
   crop_target_size: 512
 
-  # FLUX refinement after LaMa: "seam" is recommended; "full" lets FLUX modify
-  # the whole intervention region; "none" keeps LaMa only.
+  # LaMa 删除完成后的 FLUX 修复模式：
+  #   seam：只修复删除区域边界，推荐正式使用
+  #   full：允许 FLUX 修改整个 intervention 区域
+  #   none：完全不使用 FLUX refinement
   flux_refine_mode: "seam"
   flux_seam_width_px: 6
 
-  # GPU-memory controls. For ~16 GB GPUs, sequential_cpu_offload=true is the
-  # recommended setting.
+  # GPU 显存控制。
+  # 对约 16GB 显存的显卡，推荐 sequential_cpu_offload=true。
+  # cpu_offload 和 sequential_cpu_offload 只能开启一个。
   cpu_offload: false
   sequential_cpu_offload: true
+
+  # 开启 VAE tiling 可以进一步降低 VAE 峰值显存。
   vae_tiling: true
 
-  # OpenCV fallback settings; only used when backend="opencv".
+  # 仅在 backend="opencv" 时使用。
   opencv_radius: 3.0
   opencv_method: "telea"
 
 
 simlingo:
-  # Device used by the original SimLingo model.
+  # 原始官方 SimLingo 的推理设备。
   device: "cuda"
 
-  # Reproducibility seed. Official inference is greedy, but the seed is still
-  # fixed to remove avoidable stochasticity.
+  # 固定随机种子。
+  # 当前官方 SimLingo 推理主要是 greedy，但仍固定 seed，避免额外随机性。
   seed: 42
 
-  # Whether to save generated language text in final actor records.
+  # 是否把语言生成结果写入最终 actor 记录。
   save_language: false
 
-  # Saved route RGB is already JPEG-encoded. Keep false for the final baseline
-  # to avoid an unnecessary second JPEG round-trip.
+  # 当前 route 中的 RGB 本身已经是 JPEG。
+  # 正式 baseline 建议保持 false，避免再次 JPEG 压缩。
   emulate_online_jpeg_roundtrip: false
   jpeg_quality: 95
 
-  # Reject modified SimLingo source trees. Keep false for the final experiment.
+  # 是否允许使用非官方/经过修改的 SimLingo 源码树。
+  # 最终论文实验应保持 false。
   allow_nonofficial_tree: false
 
 
 runtime:
-  # Resource-safe processing unit. A chunk never splits one frame. The pipeline
-  # first creates temporary counterfactuals for at most this many actors, unloads
-  # the inpainting models, loads SimLingo, evaluates them, then deletes the temp
-  # images. Larger values reduce model reload overhead but use more temporary disk.
+  # 单个处理 chunk 中最多包含多少个 actor intervention。
+  #
+  # 一个 frame 不会被拆到两个 chunk 中。
+  # 程序先生成当前 chunk 的临时反事实图，再卸载 inpainting 模型，
+  # 加载 SimLingo 完成推理与 AD/FD，随后删除临时图。
+  #
+  # 数值越大：
+  #   模型重新加载次数越少，但临时磁盘占用越高。
+  # 数值越小：
+  #   临时磁盘占用越低，但模型重新加载次数越多。
   max_counterfactuals_per_chunk: 16
 
-  # If true, a route with final summary status="complete" is skipped on rerun.
+  # 若某条 route 已经存在 status="complete" 的最终 summary，重新运行时是否跳过。
   resume_completed_routes: true
 
-  # If a previous route output is incomplete, delete/rebuild it rather than
-  # mixing partial results from different runs.
+  # 如果上一次某条 route 没有完整处理完，是否删除旧的不完整结果并重新构建。
+  # 正式实验建议保持 true，避免不同运行配置的部分结果混在一起。
   rebuild_incomplete_routes: true
 
-  # Print a short progress line every N evaluated actors.
+  # 每处理多少个 actor 在终端打印一次简短进度。
   progress_every: 1
 
 
 debug:
-  # Master debug switch.
+  # Debug 总开关。
   enabled: true
 
-  # Save one debug image every N evaluated actor interventions.
+  # 每处理多少个 actor 保存一张 debug 图。
+  # 正式大批量实验建议调大，例如 20、50；验证阶段可以设为 1。
   every_n_actors: 20
 
-  # Final debug layout is compact:
-  # LEFT  = original RGB + original predicted future waypoints + GT
-  # RIGHT = counterfactual RGB + counterfactual predicted future waypoints + GT
-  # RED = prediction, GREEN = ground truth.
+  # 是否保存 waypoint 对比图：
+  #   左：原始前视图 + 原始预测 + GT
+  #   右：反事实前视图 + 反事实预测 + 同一 GT
+  #   红色：prediction
+  #   绿色：ground truth
   save_waypoint_comparison: true
 
-  # Optional five-panel inpainting diagnostic:
-  # original | mask | LaMa | FLUX | final counterfactual.
-  # Keep false for large batch runs to save disk space.
+  # 是否保存 inpainting 五联调试图：
+  # original | mask | LaMa | FLUX | final counterfactual
+  #
+  # 正式批量实验建议关闭，避免 debug 图占用大量磁盘。
   save_inpainting_diagnostic: false
 
 
 output:
-  # Save final counterfactual images permanently. Keep false for low-disk batch
-  # processing; counterfactuals are still generated temporarily for inference.
+  # 是否永久保存所有反事实图。
+  # 正式低磁盘批处理建议 false；推理所需反事实图仍会在临时目录生成。
   save_counterfactual_images: false
 
-  # Save exact/intervention masks permanently. Keep false for low-disk runs.
+  # 是否永久保存 exact/intervention mask。
+  # 正式低磁盘批处理建议 false。
   save_masks: false
 
-  # Save predicted/original/counterfactual trajectory arrays in actor_scores.jsonl.
-  # false keeps final output compact while preserving AD/FD and ranking.
+  # 是否在 actor_scores.jsonl 中保存完整 original/counterfactual trajectory 数组。
+  # false 时只保留 AD、FD、rank 等紧凑结果。
   save_trajectories: false
 
-  # Supplementary diagnostic AD/FD on pred_speed_wps. This NEVER changes the
-  # formal CVAA ranking, which always uses pred_route.
+  # 是否额外计算 pred_speed_wps 的 AD/FD 作为辅助诊断。
+  # 该项不会改变正式 CVAA 排名，正式排名始终基于 pred_route。
   include_speed_wps_diagnostic: true
 
-  # Formal CVAA ranking rule: AD descending, then FD descending.
+  # 是否严格检查同一 frame 的 original trajectory 在不同 actor 干预记录中完全一致。
   strict_original_consistency: true
   original_consistency_atol: 1.0e-7
   original_consistency_rtol: 1.0e-7
