@@ -52,16 +52,16 @@ conda create -n cvaa_fill python=3.10 -y
 conda activate cvaa_fill
 ```
 
-安装 PyTorch。当前项目使用 NVIDIA GPU，推荐安装 CUDA 12.1 对应版本：
+安装 PyTorch。当前项目使用 NVIDIA GPU 4090，推荐安装 CUDA 12.1 对应版本：
 
 ```bash
 先用阿里云安装 Pillow 及其他库：
-pip install pillow -i https://mirrors.aliyun.com/pypi/simple/
 
 pip install \
   pillow \
   numpy==1.26.4 \
   scipy==1.13.1 \
+  opencv-python==4.10.0.84 \
   filelock \
   typing-extensions \
   sympy \
@@ -115,12 +115,6 @@ FluxFillPipeline import OK
 
 ```bash
 python -c "import torch, cv2, numpy, PIL; print('LaMa dependencies OK')"
-```
-
-如果提示缺少 `opencv-python`、`numpy` 或 `Pillow`，安装：
-
-```bash
-pip install opencv-python==4.10.0.84 --no-deps -i https://mirrors.aliyun.com/pypi/simple/
 ```
 
 环境配置完成后，可以通过下面的命令进行最终检查：
