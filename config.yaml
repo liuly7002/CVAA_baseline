@@ -54,7 +54,7 @@ data:
   # 🐈 修改4：关键帧文件路径
   keyframe_file: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/keyframes.txt"
 
-  # 0表示使用全部的关键帧进行实验，测试阶段不要全量跑，先使用几帧进行测试，可以之后再全量跑
+  # 🐈 测试阶段只运行3条route，正式实验时将其改为0，表示使用keyframes.txt中的全部route
   max_routes: 3
 
   # The optimized pipeline ignores these frame sampling keys, but they are kept

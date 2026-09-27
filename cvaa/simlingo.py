@@ -699,7 +699,7 @@ def load_official_model(
 
     conv_module, _ = import_conversation_module(
         official_root=official_root,
-        vision_variant=str(cfg.model.vision_model.variant),
+        vision_variant=original_vision_variant,
     )
     tmp_config = AutoConfig.from_pretrained(
         str(vision_model_path),
