@@ -10,8 +10,8 @@
 # =============================================================================
 
 run:
-  # Dataset root used to resolve the relative route paths stored in keyframes.txt.
-  input: "/root/autodl-tmp/simlingo_liulei/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo"
+  # 🐈 修改1：数据集目录(用于解析 keyframes.txt 中存储的相对路径的数据集根目录)
+  input: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo"
 
   # Kept for compatibility with the existing config validator.
   # The optimized pipeline resolves routes directly from keyframes.txt.
@@ -30,16 +30,17 @@ environments:
 
 
 paths:
-  # 结果输出的文件夹路径 
-  output_root: "/root/autodl-tmp/simlingo_liulei/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/cvaa_results"
+  # 🐈 修改2：结果输出的文件夹路径 
+  output_root: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/cvaa_results"
 
-  # 1. simlingo 模型文件存放目录
+  # 🐈 修改3：模型问家存放目录
+  # 3.1. simlingo 模型文件存放目录
   official_simlingo_root: "/root/autodl-tmp/models/simlingo"
   official_simlingo_checkpoint: "/root/autodl-tmp/models/simlingo/checkpoint/simlingo/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt"
   official_simlingo_config: null
-  # 2. FLUX.1-Fill-dev 模型文件存放目录
+  # 3.2. FLUX.1-Fill-dev 模型文件存放目录
   flux_model: "/root/autodl-tmp/models/FLUX.1-Fill-dev"
-  # 3. LAMA 模型文件存放目录
+  # 3.3. LAMA 模型文件存放目录
   lama_model: "/root/autodl-tmp/models/LAMA/big-lama.pt"
 
   # null -> system temporary directory.
@@ -49,8 +50,8 @@ paths:
 
 
 data:
-  # 关键帧文件路径
-  keyframe_file: "/root/autodl-tmp/simlingo_liulei/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/keyframes.txt"
+  # 🐈 修改4：关键帧文件路径
+  keyframe_file: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/keyframes.txt"
 
   # 0 = use every route contained in the manifest.
   max_routes: 0

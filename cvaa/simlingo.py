@@ -597,15 +597,56 @@ def load_official_model(
     """
     Mirror RenzKa/simlingo team_code/agent_simlingo.py setup().
     """
+    # cfg = OmegaConf.load(str(config_path))
+    # cfg.model.vision_model.use_global_img = (
+    #     cfg.data_module.use_global_img
+    # )
+
+    # processor = AutoProcessor.from_pretrained(
+    #     cfg.model.vision_model.variant,
+    #     trust_remote_code=True,
+    # )
     cfg = OmegaConf.load(str(config_path))
     cfg.model.vision_model.use_global_img = (
         cfg.data_module.use_global_img
     )
 
-    processor = AutoProcessor.from_pretrained(
-        cfg.model.vision_model.variant,
-        trust_remote_code=True,
+    # Use the locally prepared InternVL model tree.
+    original_vision_variant = str(
+        cfg.model.vision_model.variant
     )
+    vision_model_path = (
+        official_root
+        / "pretrained"
+        / original_vision_variant.split("/")[-1]
+    ).resolve()
+
+    if not vision_model_path.is_dir():
+        raise FileNotFoundError(
+            "Local vision model directory does not exist: %s"
+            % vision_model_path
+        )
+
+    if not (
+        vision_model_path / "config.json"
+    ).is_file():
+        raise FileNotFoundError(
+            "Local vision model config.json does not exist: %s"
+            % vision_model_path
+        )
+
+    # Important: make the entire SimLingo model construction use
+    # the local InternVL tree instead of the Hugging Face model ID.
+    cfg.model.vision_model.variant = str(
+        vision_model_path
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        str(vision_model_path),
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+
     tokenizer = (
         processor.tokenizer
         if "tokenizer" in processor.__dict__
@@ -670,10 +711,16 @@ def load_official_model(
         vision_variant=str(cfg.model.vision_model.variant),
     )
 
+    # tmp_config = AutoConfig.from_pretrained(
+    #     cfg.model.vision_model.variant,
+    #     trust_remote_code=True,
+    # )
     tmp_config = AutoConfig.from_pretrained(
-        cfg.model.vision_model.variant,
+        str(vision_model_path),
         trust_remote_code=True,
+        local_files_only=True,
     )
+
     image_size = (
         tmp_config.force_image_size
         or tmp_config.vision_config.image_size
