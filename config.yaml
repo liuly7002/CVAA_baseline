@@ -30,8 +30,9 @@ environments:
 
 
 paths:
-  # 🐈 修改2：结果输出的文件夹路径 
-  output_root: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/cvaa_results"
+  # 🐈 修改2：结果输出的文件夹路径
+  # output_root: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/cvaa_results"
+  output_root: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/cvaa_results_smoke"
 
   # 🐈 修改3：模型问家存放目录
   # 3.1. simlingo 模型文件存放目录
@@ -53,8 +54,8 @@ data:
   # 🐈 修改4：关键帧文件路径
   keyframe_file: "/root/autodl-tmp/database/simlingo_v2_2026_09_12_22_24_28/data/simlingo/keyframes.txt"
 
-  # 0 = use every route contained in the manifest.
-  max_routes: 0
+  # 0表示使用全部的关键帧进行实验，测试阶段不要全量跑，先使用几帧进行测试，可以之后再全量跑
+  max_routes: 3
 
   # The optimized pipeline ignores these frame sampling keys, but they are kept
   # because the original cvaa.config validator still requires frame_step and
@@ -156,15 +157,25 @@ runtime:
 
 
 debug:
-  # Formal benchmark default. Turn on only for a small validation run.
-  enabled: false
-  every_n_actors: 20
-  save_waypoint_comparison: false
-  save_inpainting_diagnostic: false
 
+  # 正式全量阶段使用
+  # Formal benchmark default. Turn on only for a small validation run.
+  # enabled: true
+  # every_n_actors: 20
+  # save_waypoint_comparison: false
+  # save_inpainting_diagnostic: false
+
+  # 测试阶段使用
+  enabled: true
+  every_n_actors: 1
+  save_waypoint_comparison: true
+  save_inpainting_diagnostic: true
 
 output:
-  save_counterfactual_images: false
+  # 正式全量阶段使用
+  # save_counterfactual_images: false
+  # 测试阶段使用
+  save_counterfactual_images: true
   save_masks: false
   save_trajectories: false
 

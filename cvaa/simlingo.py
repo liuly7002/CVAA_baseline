@@ -597,15 +597,6 @@ def load_official_model(
     """
     Mirror RenzKa/simlingo team_code/agent_simlingo.py setup().
     """
-    # cfg = OmegaConf.load(str(config_path))
-    # cfg.model.vision_model.use_global_img = (
-    #     cfg.data_module.use_global_img
-    # )
-
-    # processor = AutoProcessor.from_pretrained(
-    #     cfg.model.vision_model.variant,
-    #     trust_remote_code=True,
-    # )
     cfg = OmegaConf.load(str(config_path))
     cfg.model.vision_model.use_global_img = (
         cfg.data_module.use_global_img
@@ -710,11 +701,6 @@ def load_official_model(
         official_root=official_root,
         vision_variant=str(cfg.model.vision_model.variant),
     )
-
-    # tmp_config = AutoConfig.from_pretrained(
-    #     cfg.model.vision_model.variant,
-    #     trust_remote_code=True,
-    # )
     tmp_config = AutoConfig.from_pretrained(
         str(vision_model_path),
         trust_remote_code=True,
