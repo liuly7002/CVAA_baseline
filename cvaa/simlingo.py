@@ -631,6 +631,9 @@ def load_official_model(
     cfg.model.vision_model.variant = str(
         vision_model_path
     )
+    cfg.model.language_model.variant = str(
+        vision_model_path
+    )
 
     processor = AutoProcessor.from_pretrained(
         str(vision_model_path),
