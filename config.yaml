@@ -160,7 +160,7 @@ debug:
 
   # 正式全量阶段使用
   # Formal benchmark default. Turn on only for a small validation run.
-  enabled: true
+  enabled: false
   every_n_actors: 20
   save_waypoint_comparison: false
   save_inpainting_diagnostic: false
